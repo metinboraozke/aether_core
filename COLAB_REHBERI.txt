@@ -1,0 +1,265 @@
+================================================================================
+AETHER CORE — COLAB VERİ ÜRETİMİ REHBERİ (MODÜL 1)
+REVİZE 2026-05-14: Teacher-Student Knowledge Distillation
+================================================================================
+
+AMAÇ
+----
+Modül 1 (Sionna 2.0 ile UWB CIR sentezi) Google Colab GPU'da çalıştırılır.
+Çıktı: Teacher-Student paired dataset (Drive'a yazılır → lokal data/'ya çekilir).
+
+    uwb_cir_oracle.npy    [N, 6, 32, 2]    Teacher: slot merkezli, gürültüsüz
+    uwb_cir_anchor.npy    [N, 4, 32, 2]    Student: 4 anchor, gürültülü
+    slot_labels.npy       [N, 6]           Slot doluluk
+    material_labels.npy   [N, 6]           0=boş, 1=metal, 2=plastik, 3=ahşap, 4=karton
+    codeword_labels.npy   [N, 6, 7]        7-bit Hamming(7,4) codeword
+    data_id_labels.npy    [N, 6]           Ham 4-bit ID (0-15)
+
+İKİ ÇALIŞTIRMA YOLU
+-------------------
+A) DOĞRUDAN SCRIPT (önerilen — bağımsız hücreler değil, tek komut):
+   Drive'a PROJESON klasörünü kopyaladıktan sonra Colab'da:
+
+       !python -m data_synthesis.generate_hybrid_sionna \
+           --n 10000 \
+           --out /content/drive/MyDrive/aether_core/data \
+           --scene scenes/aether_classroom.xml \
+           --config configs/scene.yaml \
+           --checkpoint_every 500 \
+           --seed 42
+
+   Bu YOL EN HIZLI — script bütün pipeline'ı (sahne kur, oracle pass,
+   anchor pass, Hamming enjeksiyon, gürültü, checkpoint) yönetir.
+
+B) ELLE HÜCRELİ AKIŞ (debug/öğrenme için):
+   Aşağıdaki hücre planı, A) yolundaki script'in iç adımlarını adım adım
+   gösterir. İlk seferde B) ile çalıştır, mantığı anla; sonraki üretimleri
+   A) ile tek komut yap.
+
+GENEL KURALLAR
+--------------
+- Parça parça ilerle. Her hücreyi çalıştır, çıktıya bak, sonrakine geç.
+- Her örnek farklı pozisyon / dielektrik / gürültü / ID almalı (stochastic).
+- Teacher CIR temiz; sadece Student CIR'a gürültü uygulanır.
+
+================================================================================
+HÜCRE 1 — RUNTIME GPU KONTROLÜ
+================================================================================
+Amaç: Colab oturumunda GPU var mı?
+İçerik:
+    !nvidia-smi
+
+Beklenen: T4 / V100 / A100. CPU runtime ise Runtime > Change runtime type
+> GPU seç. Sionna RT için A100 ideal.
+
+================================================================================
+HÜCRE 2 — SİONNA VE BAĞIMLILIKLARI KUR
+================================================================================
+İçerik:
+    !pip install -q sionna mitsuba pywavelets pyyaml tqdm
+
+Sionna 2.0 + Mitsuba 3 + yardımcılar. TensorFlow Colab'da hâlâ kurulu.
+
+================================================================================
+HÜCRE 3 — DRIVE MOUNT VE PROJE KLASÖRÜ
+================================================================================
+İçerik:
+    from google.colab import drive
+    drive.mount('/content/drive')
+
+    PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+    OUTPUT_DIR   = '/content/drive/MyDrive/aether_core/data'
+
+    import os, sys
+    sys.path.insert(0, PROJECT_ROOT)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.chdir(PROJECT_ROOT)
+    print('cwd:', os.getcwd())
+    print('contents:', os.listdir('.'))
+
+PROJESON klasörünü Drive'a elle kopyalamış olmalısın (tüm proje + scenes/
++ configs/ + data_synthesis/ dahil).
+
+================================================================================
+HÜCRE 4 — KONFİGÜRASYON YÜKLE
+================================================================================
+İçerik:
+    import yaml
+    with open('configs/scene.yaml', 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+
+    print('Oda:', cfg['room'])
+    print('Slot merkezleri:', cfg['slot_centers_m'])
+    print('Anchor sayısı:', len(cfg['uwb_anchors']))
+    print('Hamming codeword bit sayısı:', 7)
+
+================================================================================
+HÜCRE 5 — SAHNEYİ YÜKLE VE GÖRSELLEŞTİR (debug)
+================================================================================
+İçerik:
+    from data_synthesis.generate_hybrid_sionna import build_sionna_scene
+    scene = build_sionna_scene('scenes/aether_classroom.xml', cfg, uwb_freq_hz=6.5e9)
+
+    # Sionna görselleştirme (opsiyonel)
+    # scene.preview()    # Colab'da bazen çalışır, bazen RT görüntü
+    print('Sahne yüklendi:', scene)
+    print('Frekans:', scene.frequency)
+
+NOT: Sionna 2.0'da scene.preview() runtime ortamına göre çalışmayabilir.
+Sahne yüklendiyse hata vermeden geçer, yeterli.
+
+================================================================================
+HÜCRE 6 — TEK ÖRNEK PAIRED ÜRET (sanity)
+================================================================================
+İçerik:
+    import numpy as np
+    from data_synthesis.generate_hybrid_sionna import build_one_paired_sample
+
+    rng = np.random.default_rng(42)
+    sample = build_one_paired_sample(
+        scene=scene, cfg=cfg,
+        sample_rate_hz=500e6, n_taps=32,
+        rng=rng, max_depth=5,
+    )
+
+    print('--- Şekil kontrolü ---')
+    for k, v in sample.items():
+        print(f'  {k}: shape={v.shape} dtype={v.dtype}')
+
+Beklenen çıktı:
+    cir_oracle:        shape=(6, 32, 2) dtype=float32
+    cir_anchor:        shape=(4, 32, 2) dtype=float32
+    slot_labels:       shape=(6,)       dtype=uint8
+    material_labels:   shape=(6,)       dtype=uint8
+    codeword_labels:   shape=(6, 7)     dtype=uint8
+    data_id_labels:    shape=(6,)       dtype=uint8
+
+================================================================================
+HÜCRE 7 — GÖRSEL DOĞRULAMA (oracle vs anchor)
+================================================================================
+Amaç: Oracle gürültüsüz, Anchor gürültülü görünmeli.
+İçerik:
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 6))
+
+    # Oracle slot 0 magnitude
+    o = sample['cir_oracle'][0,...,0] + 1j*sample['cir_oracle'][0,...,1]
+    axes[0,0].plot(np.abs(o)); axes[0,0].set_title('Oracle slot 0 |CIR|')
+
+    # Oracle CFR (FFT)
+    axes[0,1].plot(np.abs(np.fft.fftshift(np.fft.fft(o))))
+    axes[0,1].set_title('Oracle slot 0 |CFR| — Hamming çentikleri görünmeli')
+
+    # Anchor 0 magnitude
+    a = sample['cir_anchor'][0,...,0] + 1j*sample['cir_anchor'][0,...,1]
+    axes[1,0].plot(np.abs(a)); axes[1,0].set_title('Anchor 0 |CIR| — gürültülü')
+
+    # Anchor 0 CFR
+    axes[1,1].plot(np.abs(np.fft.fftshift(np.fft.fft(a))))
+    axes[1,1].set_title('Anchor 0 |CFR|')
+    plt.tight_layout(); plt.show()
+
+KRİTİK KONTROL:
+- Oracle |CFR| üzerinde dolu slotlar için 7-bit codeword'a karşılık gelen
+  çentikler net görünmeli (bit=1 olan bantlar belirgin dip yapar).
+- Anchor |CFR| daha bulanık olmalı (gürültü var).
+
+================================================================================
+HÜCRE 8 — TOPLU ÜRETİM (DİREKT script ile)
+================================================================================
+Amaç: Asıl üretim. N=10000 örnek, checkpoint her 500'de bir.
+İçerik (komut):
+    !python -m data_synthesis.generate_hybrid_sionna \
+        --n 10000 \
+        --out {OUTPUT_DIR} \
+        --scene scenes/aether_classroom.xml \
+        --config configs/scene.yaml \
+        --checkpoint_every 500 \
+        --seed 42
+
+Süre tahmini:
+    A100: ~30-60 dakika 10k örnek için (her örnek 2 path-solve)
+    T4:   ~3-5 saat 10k örnek için
+    100k için bu sürelerin 10 katı.
+
+KRAL NOTU: İlk denemede n=100 dene → ~1 dakika sürer, pipeline çalıştığını
+gör → sonra n=10000'e çık.
+
+================================================================================
+HÜCRE 9 — SANITY CHECK (üretilen .npy dosyaları)
+================================================================================
+İçerik:
+    import numpy as np
+
+    files = {
+        'oracle':    'uwb_cir_oracle.npy',
+        'anchor':    'uwb_cir_anchor.npy',
+        'slot':      'slot_labels.npy',
+        'material':  'material_labels.npy',
+        'codeword':  'codeword_labels.npy',
+        'data_id':   'data_id_labels.npy',
+    }
+    for name, fname in files.items():
+        arr = np.load(os.path.join(OUTPUT_DIR, fname))
+        print(f'{name:10s} shape={arr.shape} dtype={arr.dtype} '
+              f'min={arr.min():.3f} max={arr.max():.3f}')
+
+    # Şekil assert'leri
+    o = np.load(os.path.join(OUTPUT_DIR, 'uwb_cir_oracle.npy'))
+    a = np.load(os.path.join(OUTPUT_DIR, 'uwb_cir_anchor.npy'))
+    c = np.load(os.path.join(OUTPUT_DIR, 'codeword_labels.npy'))
+    assert o.shape[1:] == (6, 32, 2), o.shape
+    assert a.shape[1:] == (4, 32, 2), a.shape
+    assert c.shape[1:] == (6, 7),     c.shape
+    print('OK — tüm şekiller doğru.')
+
+================================================================================
+HÜCRE 10 — DRIVE'DAN LOKALE TAŞIMA (BİTTİĞİNDE)
+================================================================================
+Bu adım LOKALDE yapılır:
+
+1. Drive Desktop yüklüyse:
+   /content/drive/MyDrive/aether_core/data/  →  Drive klasöründe senkron.
+   Oradan PROJESON/data/ içine elle kopyala.
+
+2. Drive Desktop yoksa:
+   drive.google.com → MyDrive/aether_core/data/ → 6 dosyayı seç → indir →
+   PROJESON/data/ klasörüne yapıştır.
+
+Beklenen lokal sonuç:
+    PROJESON/data/uwb_cir_oracle.npy
+    PROJESON/data/uwb_cir_anchor.npy
+    PROJESON/data/slot_labels.npy
+    PROJESON/data/material_labels.npy
+    PROJESON/data/codeword_labels.npy
+    PROJESON/data/data_id_labels.npy
+
+================================================================================
+BİTTİĞİNDE
+================================================================================
+.npy dosyaları PROJESON/data/ içine geldiğinde bana haber ver. Sırada:
+    - Modül 2 (preprocessing) — lokalde, CPU yeterli
+    - Modül 3 (encoder) — UWB encoder + CSI encoder cross-attention
+    - Modül 4 (heads) — detection, recognition, identification (KD ile)
+
+================================================================================
+HATA AYIKLAMA NOTU (Sionna API sürüm uyumsuzlukları)
+================================================================================
+Sionna 2.0 RT API'sinin bazı imzaları minor sürümlerde değişebilir. En sık
+görülen hatalar ve çözümleri:
+
+a) "module 'sionna.rt' has no attribute 'load_scene'":
+   → Sionna 0.x kurulu olabilir. !pip install -U sionna ile güncelle.
+
+b) "PathSolver() takes no arguments" veya "compute_paths() got unexpected kwarg":
+   → API revize edilmiş. data_synthesis/generate_hybrid_sionna.py içindeki
+     compute_cir_for_current_rxs() fonksiyonunu Sionna doc'una göre güncelle.
+
+c) "ITURadioMaterial preset 'X' not found":
+   → assign_slot_materials() içindeki iturm_map sözlüğündeki preset adlarını
+     güncel Sionna ITURadioMaterial dokümanından kontrol et (bazı isimler
+     'itu_metal' → 'metal' gibi değişti).
+
+Hatayla karşılaşırsan: Hücre numarasını + tam hata stack trace'ini bana
+yapıştır. Beraber düzeltiriz.

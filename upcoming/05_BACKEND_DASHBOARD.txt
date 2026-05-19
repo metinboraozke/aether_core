@@ -1,0 +1,403 @@
+================================================================================
+BACKEND + DASHBOARD — REAL-TIME PIPELINE (REHBER)
+================================================================================
+Tarih: 2026-05-15
+Status: ✅ TAMAMLANDI 2026-05-15
+        Backend 4 dosya + Dashboard 3 dosya gerçek, birim test geçti.
+
+Implementasyon özet:
+  backend/main.py:               FastAPI app + lifespan + 4 HTTP + 2 WS endpoint
+  backend/inference_server.py:   InferenceEngine async master tick (50 ms)
+                                  + sync_buffer + AdaptiveBaseline + preprocess
+                                  + model forward + tracker step + broadcast
+  backend/ws_stream.py:          /ws/ingest (edge cihaz) + /ws/predict (dashboard)
+  backend/sync_buffer.py:        (önceden zaten) MultiSensorSyncBuffer
+
+  dashboard/index.html:          Three.js importmap + HUD + canvas
+  dashboard/main.js:             Scene + OrbitControls + WS client + render loop
+  dashboard/voxel_renderer.js:   InstancedMesh (3072 voxel = 6 slot × 8³)
+                                  + createShelfWireframe + createRoomWireframe
+
+Test sonuçları:
+  FastAPI app: ['/', '/telemetry', '/reset_baseline', '/ws/ingest', '/ws/predict']
+  Mock tick (no model):  3 ms (sync + baseline + preprocess + mock output)
+  Real model tick (CPU): 144 ms (preprocess + model + tracker, 200 ms hedef OK)
+  WS routes registered: 2/2 (ingest + predict)
+  HTTP routes test: GET / → 200 ok, GET /telemetry → 200 (7 telemetry alanı),
+                    POST /reset_baseline → 200 ok
+
+Çalıştırma:
+  uvicorn backend.main:app --host 0.0.0.0 --port 8000
+  Dashboard: dashboard/index.html'i tarayıcıda aç (file:// veya simple HTTP server)
+
+Detaylı kayıt: memory/project_decisions.md "2026-05-15 FAZ 5 TAMAMLANDI"
+
+HEDEF
+  PDF Modül 5 Adım 3 (FastAPI + WebSocket) + Adım 4 (Three.js voxel dashboard).
+  End-to-end real-time loop:
+    ESP32/UWB cihazları → WS push → sync_buffer → preprocessing → student model
+    → tracking_engine → WS broadcast → dashboard render
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) backend/main.py
+   ────────────────
+   Hedef: FastAPI app, router registration.
+
+   import fastapi, uvicorn
+   from backend.ws_stream import router as ws_router
+   from backend.inference_server import InferenceEngine
+
+   app = fastapi.FastAPI(title="Aether Core")
+
+   @app.on_event("startup")
+   async def startup():
+       app.state.engine = InferenceEngine(
+           checkpoint_path="checkpoints/student.pt",
+           sync_buffer_cfg={...},
+           runtime_cfg={...},   # configs/training.yaml > runtime
+       )
+       app.state.engine.start()   # background asyncio.create_task
+
+   @app.on_event("shutdown")
+   async def shutdown():
+       app.state.engine.stop()
+
+   app.include_router(ws_router)
+
+   if __name__ == "__main__":
+       uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+
+2) backend/ws_stream.py  (mevcut docstring genişletilir)
+   ─────────────────────────────────────────────────
+   Hedef: WebSocket endpoint'leri.
+
+   from fastapi import APIRouter, WebSocket
+   router = APIRouter()
+
+   @router.websocket("/ws/ingest")
+   async def ingest(ws: WebSocket):
+       """Edge cihazlardan (ESP32/UWB) gelen sensor packet'leri."""
+       await ws.accept()
+       engine = ws.app.state.engine
+       try:
+           while True:
+               msg = await ws.receive_json()
+               # {node_id, sensor, link_id, t_capture_ns, payload}
+               if msg["sensor"] == "wifi":
+                   engine.sync_buffer.push_wifi(
+                       msg["link_id"], msg["t_capture_ns"],
+                       np.asarray(msg["payload"]).reshape(108, 2))
+               elif msg["sensor"] == "uwb":
+                   engine.sync_buffer.push_uwb(
+                       msg["link_id"], msg["t_capture_ns"],
+                       np.asarray(msg["payload"]).reshape(32, 2))
+       except WebSocketDisconnect:
+           pass
+
+   @router.websocket("/ws/predict")
+   async def predict(ws: WebSocket):
+       """Dashboard'a tahmin paketi yayını."""
+       await ws.accept()
+       engine = ws.app.state.engine
+       engine.add_subscriber(ws)
+       try:
+           while True:
+               await asyncio.sleep(1.0)   # heartbeat
+       except WebSocketDisconnect:
+           engine.remove_subscriber(ws)
+
+
+3) backend/inference_server.py  (mevcut docstring genişletilir)
+   ──────────────────────────────────────────────────────
+   Hedef: Master tick loop + model inference + WS broadcast.
+
+   class InferenceEngine:
+     def __init__(self, checkpoint_path, sync_buffer_cfg, runtime_cfg):
+       # Model yükle (StudentModel veya FusedCSIUWBNet)
+       self.model = torch.load(checkpoint_path, map_location="cuda")
+       self.model.eval()
+
+       # Sync buffer
+       self.sync_buffer = MultiSensorSyncBuffer(**sync_buffer_cfg)
+
+       # Adaptive baseline (preprocessing/differential_csi.py)
+       self.baseline = AdaptiveBaseline(**runtime_cfg["baseline"])
+       self.baseline.load_reference("data/baseline_ref.npy")   # varsa
+
+       # Sliding tracker (models/heads/tracker.py)
+       self.tracker = TrackingEngine(
+           model=SlidingTracker(),
+           master_tick_ms=runtime_cfg["master_tick_ms"]
+       )
+
+       self.master_tick_s = runtime_cfg["master_tick_ms"] / 1000.0
+       self.running = False
+       self.subscribers = set()
+       self.last_detection_mask = np.zeros(6, dtype=np.uint8)
+
+     def add_subscriber(self, ws): self.subscribers.add(ws)
+     def remove_subscriber(self, ws): self.subscribers.discard(ws)
+
+     def start(self):
+       self.running = True
+       asyncio.create_task(self._predict_loop())
+
+     def stop(self):
+       self.running = False
+       self.baseline.save_reference("data/baseline_ref.npy")
+
+     async def _predict_loop(self):
+       """Master tick (50 ms) loop — sync + preprocess + inference + broadcast."""
+       while self.running:
+         await asyncio.sleep(self.master_tick_s)
+         now_ns = time.time_ns()
+         frame = self.sync_buffer.aligned_frame(now_ns)
+         if frame is None:
+           continue   # eksik link → tick atla
+
+         # 1) Diferansiyel CSI (adaptive baseline)
+         wifi = frame["wifi"]   # (28, 108, 2)
+         self.baseline.update(wifi, self.last_detection_mask)
+         csi_delta = self.baseline.compute_delta(wifi)
+
+         # 2) Preprocessing (Modül 2 pipeline)
+         csi_tensor = preprocess_csi(csi_delta)   # (1, 28, 2, 108)
+         uwb_tensor = preprocess_uwb(frame["uwb"])  # (1, 6, 2, 32)
+         link_geo = LINK_GEO_CACHE  # tek seferde hesapla
+
+         # 3) Model inference
+         t_start = time.perf_counter()
+         with torch.no_grad():
+           out = self.model(csi_tensor, uwb_tensor, link_geo)
+         inference_ms = (time.perf_counter() - t_start) * 1000
+
+         # 4) Tracking (sliding window)
+         track = self.tracker.step(csi_delta)
+
+         # 5) Output packet
+         packet = {
+           "t_master_ns": frame["t_master_ns"],
+           "detection_mask": out["detection_mask"].cpu().tolist(),
+           "materials": out["material_logits"].argmax(-1).cpu().tolist(),
+           "barcode_sparse": _sparse_barcode(out["barcode_codeword"]),
+           "uncertainty": out["tsdf_sigma2"].cpu().tolist(),
+           "tracking": track,
+           "telemetry": {
+             "inference_ms": inference_ms,
+             "sync_telemetry": self.sync_buffer.telemetry(),
+           }
+         }
+
+         # 6) Broadcast
+         await self._broadcast(packet)
+         self.last_detection_mask = out["detection_mask"].cpu().numpy()
+
+     async def _broadcast(self, packet):
+       dead = []
+       for ws in self.subscribers:
+         try:
+           await ws.send_json(packet)
+         except Exception:
+           dead.append(ws)
+       for ws in dead:
+         self.subscribers.discard(ws)
+
+
+================================================================================
+DASHBOARD (THREE.JS VOXEL)
+================================================================================
+
+4) dashboard/index.html  (placeholder hazır)
+   ─────────────────────────────────────
+   Three.js importmap + canvas + HUD overlay.
+   ws-status, fps, drop-ratio göstergeleri.
+
+5) dashboard/main.js
+   ─────────────────
+   /**
+    * Scene + camera + orbit controls setup.
+    * WebSocket client → /ws/predict bağlanır.
+    * Her paket gelince voxel_renderer.update(payload).
+    */
+   import * as THREE from 'three';
+   import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+   import { createVoxelMesh, updateVoxels } from './voxel_renderer.js';
+
+   // 1. Scene
+   const scene = new THREE.Scene();
+   scene.background = new THREE.Color(0x0a0a0a);
+   const camera = new THREE.PerspectiveCamera(60,
+                  window.innerWidth/window.innerHeight, 0.1, 100);
+   camera.position.set(10, 10, 8);
+   const renderer = new THREE.WebGLRenderer({antialias: true});
+   document.getElementById('app').appendChild(renderer.domElement);
+   const controls = new OrbitControls(camera, renderer.domElement);
+
+   // 2. Room grid (10×5×3 m oda referansı)
+   const room = new THREE.Box3(new THREE.Vector3(0,0,0),
+                               new THREE.Vector3(10,5,3));
+   const helper = new THREE.Box3Helper(room, 0x666666);
+   scene.add(helper);
+
+   // 3. 6-slot shelf wireframe
+   const shelf = drawShelf({center:[5,2.5,1.5], size:[1,0.4,1], slots:6});
+   scene.add(shelf);
+
+   // 4. Voxel mesh (8×8×8 grid × 6 slot = 3072 voxel max)
+   const voxelMesh = createVoxelMesh({gridSize: [8,8,8], nSlots: 6});
+   scene.add(voxelMesh);
+
+   // 5. WebSocket
+   const ws = new WebSocket('ws://localhost:8000/ws/predict');
+   ws.onopen  = () => document.getElementById('ws-status').textContent = 'connected';
+   ws.onmessage = (e) => {
+     const payload = JSON.parse(e.data);
+     updateVoxels(voxelMesh, payload);
+     document.getElementById('fps').textContent =
+       payload.telemetry.inference_ms.toFixed(1) + ' ms';
+   };
+   ws.onclose = () => document.getElementById('ws-status').textContent = 'closed';
+
+   // 6. Render loop
+   function animate() {
+     requestAnimationFrame(animate);
+     controls.update();
+     renderer.render(scene, camera);
+   }
+   animate();
+
+6) dashboard/voxel_renderer.js
+   ─────────────────────────
+   /**
+    * InstancedMesh ile voxel grid (3072 instance, tek draw call).
+    *
+    * Voxel rendering kuralları (PDF Modül 5 Adım 4):
+    *   Opacity = Bayesian μ (doluluk olasılığı)
+    *   Color   = material (Metal:gümüş, Plastik:mavi, Ahşap:kahve, Karton:bej)
+    *             + ID hue shift (barcode)
+    *   Uncertainty overlay = σ² yüksekse glow (additive blending)
+    */
+   import * as THREE from 'three';
+
+   const MATERIAL_COLORS = {
+     0: 0x666666,  // boş
+     1: 0xc0c0c0,  // metal
+     2: 0x4488ff,  // plastik
+     3: 0x884422,  // ahşap
+     4: 0xddccaa,  // karton
+   };
+
+   export function createVoxelMesh({gridSize: [gx,gy,gz], nSlots}) {
+     const total = gx * gy * gz * nSlots;
+     const geo = new THREE.BoxGeometry(0.05, 0.05, 0.05);
+     const mat = new THREE.MeshStandardMaterial({
+       transparent: true, opacity: 0.5, depthWrite: false,
+     });
+     const mesh = new THREE.InstancedMesh(geo, mat, total);
+     mesh.userData = {gx, gy, gz, nSlots};
+     return mesh;
+   }
+
+   export function updateVoxels(mesh, payload) {
+     const {gx, gy, gz, nSlots} = mesh.userData;
+     const mu = payload.tsdf_mu;     // [6, 8, 8, 8]
+     const sigma2 = payload.uncertainty;
+     const materials = payload.materials;
+
+     const matrix = new THREE.Matrix4();
+     const color = new THREE.Color();
+     let idx = 0;
+     for (let s = 0; s < nSlots; s++) {
+       const matColor = MATERIAL_COLORS[materials[s]];
+       const slotCenter = SLOT_CENTERS[s];  // scene.yaml'dan
+       for (let i = 0; i < gx; i++)
+         for (let j = 0; j < gy; j++)
+           for (let k = 0; k < gz; k++) {
+             const opacity = mu[s][i][j][k];
+             const unc = sigma2[s][i][j][k];
+             matrix.makeTranslation(
+               slotCenter[0] + (i - gx/2) * 0.05,
+               slotCenter[1] + (j - gy/2) * 0.05,
+               slotCenter[2] + (k - gz/2) * 0.05);
+             matrix.scale(new THREE.Vector3(opacity, opacity, opacity));
+             mesh.setMatrixAt(idx, matrix);
+             color.setHex(matColor);
+             if (unc > 0.5) color.multiplyScalar(1.3);  // glow
+             mesh.setColorAt(idx, color);
+             idx++;
+           }
+     }
+     mesh.instanceMatrix.needsUpdate = true;
+     mesh.instanceColor.needsUpdate = true;
+   }
+
+
+================================================================================
+ENTEGRASYON SIRASI
+================================================================================
+
+1. FAZ 5A — Backend kuruluş:
+   - main.py + ws_stream.py + inference_server.py
+   - InferenceEngine MOCK mode (model yok, rastgele output)
+   - Test: curl/wscat ile WS connect + 50 ms broadcast geliyor mu
+
+2. FAZ 5B — Dashboard:
+   - index.html + main.js + voxel_renderer.js
+   - WS bağlantı kur, mock paket ile voxel render
+
+3. FAZ 5C — Gerçek model entegrasyonu:
+   - checkpoint yükle (Modül 6 eğitim sonrası)
+   - end-to-end latency telemetrisi
+
+
+================================================================================
+TEST + ÖLÇÜM
+================================================================================
+
+def test_inference_engine_mock():
+    engine = InferenceEngine(checkpoint_path=None, mock_mode=True)
+    engine.start()
+    # 1 sn bekle, telemetry kontrol et
+    time.sleep(1.0)
+    tel = engine.sync_buffer.telemetry()
+    assert tel["dropped_ticks"] > 10   # mock data yok, hep drop bekleniyor
+
+def test_full_loop_with_recorded_data():
+    """Replay edilmiş bir gerçek session ile end-to-end test."""
+    engine = InferenceEngine(checkpoint_path="checkpoints/student.pt")
+    replay = load_recorded_session("tests/replay.bin")
+    for pkt in replay:
+        if pkt.sensor == "wifi":
+            engine.sync_buffer.push_wifi(...)
+        else:
+            engine.sync_buffer.push_uwb(...)
+    # 50 ms tick'ler sonra aligned_ticks > 0
+
+
+================================================================================
+LATENCY HEDEF KONTROL
+================================================================================
+
+NET = preprocess_ms + inference_ms + ws_send_ms < 200 ms
+Eğer aşılırsa:
+  - Modül 5 distillation devreye girmeli (student model)
+  - Veya batch size = 1 yerine async pipelined inference
+  - Veya GPU yerine TensorRT/ONNX runtime
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+  backend ~400 satır Python
+  dashboard ~300 satır JavaScript
+  test ~150 satır
+  Tahmin: 1-2 mesaj (backend bir, dashboard ikinci)
+
+BAĞIMLILIK: fastapi, uvicorn[standard], websockets, torch, three.js (CDN)
+            + models/fused_model.py (Modül 4 sonrası)
+            + preprocessing/* (Modül 2 sonrası)

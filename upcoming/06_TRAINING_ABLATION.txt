@@ -1,0 +1,294 @@
+================================================================================
+EĞİTİM + ABLATION — REHBER
+================================================================================
+Tarih: 2026-05-15 (ilk plan) → 2026-05-19 (FAZ 6 TAMAMLANDI)
+Status: ✅ TAMAMLANDI 2026-05-19
+  + data_synthesis/multi_domain_dataset.py   (MultiDomainDataset + collate)
+  + training/__init__.py
+  + training/eval.py        (det/rec/id metrik + master evaluate)
+  + training/train.py       (train_baseline + train_dann_phase + distill CLI)
+  + training/ablation.py    (5 varyant runner + JSON dump + özet tablo)
+
+MEVCUT 5K MİNİ TEST (2 epoch × 5 varyant, CPU):
+  full:        det_f1=0.700, rec=0.249, id_bit=0.502, time=197.6 s
+  no_path_aux: det_f1=0.763, rec=0.248, id_bit=0.501, time=172.1 s
+  no_dann:     det_f1=0.703, rec=0.248, id_bit=0.538, time=130.3 s
+  no_kd:       det_f1=0.746, rec=0.248, id_bit=0.507, time=121.8 s
+  minimal:     det_f1=0.751, rec=0.248, id_bit=0.504, time=126.1 s
+  TOPLAM: 779 s (~13 dk), output: training/ablation_results.json
+
+YORUM (önemli):
+  - rec_acc ~0.25 = 4-sınıf random → 2 epoch + 5k veri yetersiz
+  - id_bit ~0.50 = bit random → aynı sebep
+  - det_f1 0.70-0.76 = ASIL pipeline doğru çalıştığını gösteren tek metrik
+  - Mini testte minimal ≥ full → aux/dann/kd loss'ları erken epoch'larda gradyana
+    ek yük getirir, 30-50 epoch + 5×100k ile asıl ablation kontrastı çıkar
+  - Pipeline çalıştığı doğrulandı; Colab GPU + production veri ile yeniden ablation
+    çalışılacak (yüksek epoch + tüm presetler, jüri sayısal tablosu için)
+
+
+HEDEF
+  Multi-domain dataset üzerinden FusedCSIUWBNet eğitimi + ablation çalışmaları
+  (path_aux on/off, DANN on/off, oracle_kd on/off, sliding window window_size).
+  Sonuç: bitirme tezi için sayısal sonuç tablosu + jüri demo modeli.
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) data_synthesis/multi_domain_dataset.py  (YENİ)
+   ─────────────────────────────────────────
+   class MultiDomainDataset(torch.utils.data.Dataset):
+     """5 preset klasöründen aynı anda okur.
+
+     data_root yapısı:
+       data/
+         classroom_default/
+           uwb_cir_oracle.npy
+           uwb_cir_anchor.npy
+           path_params_oracle.npy
+           path_params_anchor.npy
+           csivec_delta.npy
+           path_params_csi.npy
+           slot_labels.npy
+           material_labels.npy
+           codeword_labels.npy
+           data_id_labels.npy
+         warehouse_large/
+           ...
+         (5 preset)
+     """
+     def __init__(self,
+                  data_root: str = "data/",
+                  presets: list = None,
+                  preprocessing_fn=None,
+                  return_aux: bool = True):
+       presets = presets or ["classroom_default", "warehouse_large",
+                              "office_small", "lab_medium", "room_low_ceiling"]
+       # Her preset için memmap np.load, len'leri topla
+       self.preset_data = {}
+       self.preset_lens = {}
+       self.cum_lens = [0]
+       for p in presets:
+         self.preset_data[p] = self._load_preset(data_root, p)
+         self.preset_lens[p] = self.preset_data[p]["slot_labels"].shape[0]
+         self.cum_lens.append(self.cum_lens[-1] + self.preset_lens[p])
+
+       # Preset → domain_id mapping (DANN için)
+       self.domain_ids = {p: i for i, p in enumerate(presets)}
+
+       # Link geometry cache (her preset'in kendi yaml'ından hesaplanır)
+       self.link_geo_cache = {p: self._compute_link_geo(p) for p in presets}
+
+     def __len__(self):
+       return self.cum_lens[-1]
+
+     def __getitem__(self, idx):
+       # idx → preset + local_idx
+       preset = self._find_preset(idx)
+       local = idx - self.cum_lens[self._preset_index(preset)]
+       d = self.preset_data[preset]
+
+       sample = {
+         "csi":     d["csivec_delta"][local],         # (28, 108, 2)
+         "uwb":     d["uwb_cir_anchor"][local],       # (6, 32, 2)
+         "link_geo": self.link_geo_cache[preset],      # (28, 3)
+         "labels": {
+           "slot":     d["slot_labels"][local],
+           "material": d["material_labels"][local],
+           "codeword": d["codeword_labels"][local],
+         },
+         "domain_id": self.domain_ids[preset],   # int 0..4 (DANN)
+         "preset_name": preset,                  # logging için
+       }
+       if self.return_aux:
+         sample["aux"] = {
+           "oracle_cir":   d["uwb_cir_oracle"][local],
+           "path_oracle":  d["path_params_oracle"][local],
+           "path_anchor":  d["path_params_anchor"][local],
+           "path_csi":     d["path_params_csi"][local],
+         }
+       return sample
+
+
+2) training/train.py  (YENİ klasör + dosya)
+   ───────────────────────────────────
+   #!/usr/bin/env python
+   """Aether Core ana eğitim script'i. Birden çok faz koşturulabilir."""
+   import argparse, yaml, torch
+   from torch.utils.data import DataLoader
+   from data_synthesis.multi_domain_dataset import MultiDomainDataset
+   from models.fused_model import FusedCSIUWBNet
+   from adaptation.dann import DomainDiscriminator, grl_lambda_schedule
+   from preprocessing import preprocess_csi, preprocess_uwb
+
+   def main():
+     p = argparse.ArgumentParser()
+     p.add_argument("--config", default="configs/training.yaml")
+     p.add_argument("--phase", choices=["baseline","dann","p1","p2","distill"])
+     p.add_argument("--checkpoint_in",  default=None)
+     p.add_argument("--checkpoint_out", required=True)
+     p.add_argument("--epochs", type=int, default=20)
+     args = p.parse_args()
+
+     with open(args.config) as f: cfg = yaml.safe_load(f)
+
+     # Dataset
+     ds = MultiDomainDataset(data_root="data/", return_aux=True)
+     loader = DataLoader(ds, batch_size=cfg.get("batch_size", 32),
+                          shuffle=True, num_workers=4)
+
+     # Model
+     model = FusedCSIUWBNet().cuda()
+     if args.checkpoint_in:
+       model.load_state_dict(torch.load(args.checkpoint_in))
+
+     if args.phase == "baseline":
+       train_baseline(model, loader, args.epochs, cfg)
+     elif args.phase == "dann":
+       disc = DomainDiscriminator(in_dim=256).cuda()
+       train_dann(model, disc, loader, args.epochs, cfg)
+     elif args.phase == "p1":
+       train_phase1(model, loader, args.epochs, cfg)
+     elif args.phase == "p2":
+       train_phase2(model, loader, args.epochs, cfg)
+     elif args.phase == "distill":
+       student = StudentModel().cuda()
+       train_distillation(model, student, loader, args.epochs, cfg)
+       torch.save(student.state_dict(), args.checkpoint_out)
+       return
+     torch.save(model.state_dict(), args.checkpoint_out)
+
+
+3) training/train_baseline.py
+   ────────────────────────
+   def train_baseline(model, loader, epochs, cfg):
+     opt = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-3))
+     for epoch in range(epochs):
+       for batch in loader:
+         csi = preprocess_csi_batch(batch["csi"]).cuda()
+         uwb = preprocess_uwb_batch(batch["uwb"]).cuda()
+         link_geo = batch["link_geo"].float().cuda()
+         out = model(csi, uwb, link_geo, return_aux=True)
+
+         # Ana loss
+         loss = total_loss(out, batch["labels"], batch["aux"], cfg["lambdas"])
+         opt.zero_grad()
+         loss.backward()
+         opt.step()
+       log_epoch(epoch, loss)
+
+
+4) training/ablation.py  (YENİ)
+   ──────────────────────
+   """Ablation çalışmaları için varyantları sırayla koşturur."""
+
+   ABLATIONS = [
+     {"name": "full",              "path_aux": True,  "dann": True,  "oracle_kd": True},
+     {"name": "no_path_aux",       "path_aux": False, "dann": True,  "oracle_kd": True},
+     {"name": "no_dann",           "path_aux": True,  "dann": False, "oracle_kd": True},
+     {"name": "no_kd",             "path_aux": True,  "dann": True,  "oracle_kd": False},
+     {"name": "minimal",           "path_aux": False, "dann": False, "oracle_kd": False},
+   ]
+
+   def run_all_ablations():
+     for cfg_ablation in ABLATIONS:
+       lambdas = {
+         "csi_path":   0.3 if cfg_ablation["path_aux"] else 0.0,
+         "uwb_path":   0.3 if cfg_ablation["path_aux"] else 0.0,
+         "kd_oracle":  0.5 if cfg_ablation["oracle_kd"] else 0.0,
+         "recognition": 1.0, "identification": 1.0, "tsdf": 0.3,
+       }
+       grl_max = 0.7 if cfg_ablation["dann"] else 0.0
+       # train + eval
+       model = train_with_config(lambdas=lambdas, grl_max_lambda=grl_max)
+       metrics = evaluate(model, val_loader)
+       log_ablation(cfg_ablation["name"], metrics)
+
+
+================================================================================
+EĞİTİM SIRASI (END-TO-END)
+================================================================================
+
+Sentetik veri varsayımı: 5 preset × 1k = 5k baseline (MVP).
+Sonra 5 preset × 10k = 50k, sonra 100k için tekrar.
+
+  # 1. Baseline (sentetik veride supervised)
+  python -m training.train --phase=baseline \
+      --checkpoint_out=checkpoints/baseline.pt --epochs=20
+
+  # 2. DANN (sentetik + etiketsiz gerçek)
+  python -m training.train --phase=dann \
+      --checkpoint_in=checkpoints/baseline.pt \
+      --checkpoint_out=checkpoints/dann.pt --epochs=10
+
+  # 3. Phase 1 adapter (etiketsiz gerçek)
+  python -m training.train --phase=p1 \
+      --checkpoint_in=checkpoints/dann.pt \
+      --checkpoint_out=checkpoints/p1.pt --epochs=5
+
+  # 4. Phase 2 adapter (etiketli gerçek)
+  python -m training.train --phase=p2 \
+      --checkpoint_in=checkpoints/p1.pt \
+      --checkpoint_out=checkpoints/p2.pt --epochs=5
+
+  # 5. Distillation
+  python -m training.train --phase=distill \
+      --checkpoint_in=checkpoints/p2.pt \
+      --checkpoint_out=checkpoints/student.pt --epochs=10
+
+  # 6. Inference (deployment)
+  python -m backend.main  # checkpoint=checkpoints/student.pt
+
+
+================================================================================
+EVAL METRİKLER (jüri sunumu)
+================================================================================
+
+  Detection:       Slot-wise accuracy, F1
+  Recognition:     4-class accuracy + confusion matrix
+  Identification:  Cosine sim top-1 accuracy (16 ID)
+                   + Hamming codeword bit error rate
+  TSDF:            Mean μ MSE + mean σ²
+  Tracker:         Presence AUC, motion class accuracy, velocity MAE
+
+Multi-domain breakdown: her preset için ayrı metrik tablosu
+  → preset değiştikçe bozulma var mı? (domain generalization quality)
+
+
+================================================================================
+LOG + CHECKPOINT YÖNETİMİ
+================================================================================
+
+  runs/<timestamp>/
+    config.yaml      # eğitim sırasındaki tam config snapshot
+    train.log
+    metrics.csv      # epoch, loss, acc, f1, vs
+    checkpoint.pt    # en iyi val acc
+    last.pt          # son epoch
+    eval_results.json
+
+  TensorBoard veya WandB entegrasyonu opsiyonel.
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+  multi_domain_dataset.py  ~150 satır
+  train.py                  ~200 satır
+  train_baseline.py         ~100 satır
+  train_dann.py             ~100 satır
+  train_phase1/phase2.py    ~150 satır
+  train_distillation.py     ~100 satır
+  ablation.py               ~100 satır
+  eval.py                   ~150 satır
+  TOPLAM                   ~1050 satır
+
+  Tahmin: 1 büyük mesaj (dataset + train zinciri)
+  Eğitim Colab süresi: 5k × 20 epoch ≈ 30 dk (L4 GPU)
+                       50k × 20 epoch ≈ 5 saat
+                       500k × 20 epoch ≈ 50 saat (multi session)
+
+BAĞIMLILIK: torch, fused_model.py, dann.py, residual_adapter.py, distillation.py
+            + 5 preset veri (data/ klasörü dolu olmalı)

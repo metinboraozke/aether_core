@@ -1,0 +1,121 @@
+# Aether Core — Eğitim konfigürasyonu
+# Kaynak: README.md → Modül 3, 4, 5
+
+model:
+  # Modül 3: Encoders
+  csi_link_feature_dim: 128
+  link_geo_embed_dim: 64
+  csi_transformer_layers: 4
+  csi_transformer_heads: 8       # n_heads=8
+
+  # 3-Tier UWB Encoder
+  uwb_summary_dim: 32
+  uwb_cir_dim: 64
+  uwb_cfr_dim: 64
+  uwb_latent_dim: 128            # 32 + 64 + 64 → 128
+
+  # Slot embedding (FiLM-style MLP)
+  n_slots: 6
+
+  # Modül 4: Heads
+  detection_threshold: 0.5
+  n_materials: 4                 # Metal, Plastik, Ahşap, Karton
+  barcode_latent_dim: 64         # L2-normalize edilmiş spektral imza (cosine sim için)
+  barcode_data_bits: 4           # 4-bit ID → 16 unique ürün (REVİZE 2026-05-14)
+  barcode_codeword_bits: 7       # Hamming(7,4) → 4 data + 3 parity
+  tracker_window_T: 100          # 1 sn × ölçüm hızı
+  uwb_bistatic_links: 6          # REVİZE 2026-05-15: hibrit topoloji C(4,2)=6
+  path_aux_max_paths: 20         # path_params teacher pad
+
+train:
+  batch_size: null               # TODO
+  learning_rate: null            # TODO
+  optimizer: "adamw"
+  epochs: null                   # TODO
+
+losses:
+  detection: "bce"
+  recognition: "cross_entropy"        # sadece ROI içindeki slotlar
+  identification_latent: "triplet_margin"   # 64-d latent için
+  identification_codeword: "bce"            # 7-bit Hamming codeword için
+  identification_alpha: 0.5                  # iki kayıbın ağırlık dengesi
+  tracker_presence: "bce"
+  tracker_class: "cross_entropy"
+  tracker_velocity: "mse"
+
+# Modül 5: Sim-to-Real
+domain_adaptation:
+  # GRL schedule: λ = 2 / (1 + exp(-10·p)) − 1
+  grl_schedule_alpha: 10.0
+  domain_labels:
+    sionna: 0
+    real_esp32: 1
+
+residual_adapter:
+  # Adapter formülü: x + scale · adapter(x)
+  scale_init: 0.1
+
+phases:
+  phase1_unlabeled:
+    losses: ["adversarial", "contrastive_uwb_csi"]
+    encoders_frozen: false
+  phase2_labeled:
+    losses: ["recognition", "detection"]
+    encoders_frozen: true
+    adapter_active: true
+
+# ── REVİZE 2026-05-15: Runtime parametreleri (inference path) ──
+runtime:
+  # Sync buffer (backend/sync_buffer.py)
+  sync_tolerance_ms: 5           # ±5 ms tolerans, ESP32+UWB için uygun
+  master_tick_ms: 50             # 20 Hz tahmin hızı, 200 ms PDF hedefi içinde
+  ring_capacity: 200             # her sensör ring buffer derinliği
+
+  # Adaptive baseline (preprocessing/differential_csi.py)
+  baseline:
+    alpha_continuous: 1.0e-4       # Strategy A: drift bekçisi
+    alpha_quiet: 1.0e-2            # Strategy B: motion-gated agresif EMA
+    quiet_frames_threshold: 100  # 100 frame quiet → B aktif
+
+  # Sliding window tracker (models/heads/tracker.py)
+  tracker:
+    window_size: 100             # 1 sn pencere
+    tick_ms: 50                  # her 50 ms tahmin
+
+  # DANN GRL warmup (REVİZE: ramp-up + cap, aşırı agresifliği engelle)
+  dann_warmup_epochs: 3          # ilk 3 epoch λ=0
+  dann_max_lambda: 0.7           # 1.0 yerine cap (recognition korunsun)
+
+# ── FAZ 0.5 (2026-05-19): Sensor Placement Randomization ──
+# data_synthesis/layout_variants.py + generate_*_sionna.py main() loop'u
+# Aynı odada N farklı yerleşim → model konum-bağımsız öğrenir
+layout_randomization:
+  enabled: true
+  n_variants_per_preset: 5         # her preset için kaç farklı yerleşim
+  jitter_xy_m: 0.3                 # XY gaussian std (metre) — ~30 cm
+  jitter_z_m: 0.1                  # Z  gaussian std (metre) — ~10 cm
+  room_clip_margin_m: 0.3          # oda kenarından min mesafe
+  # UWB + WiFi script'lerine AYNI değerler verilir → paired variant rotation
+  # Production: 5 preset × 5 variant × 20k = 500k toplam
+
+# ── Multi-task auxiliary loss ağırlıkları ──
+auxiliary_loss:
+  path_aux_lambda: 0.3           # MSE(predicted_paths, gt_paths) ağırlığı
+  path_aux_warmup_epochs: 5      # ilk 5 epoch λ=0, sonra ramp 0→0.3
+
+distillation:
+  # Knowledge Distillation (REVİZE 2026-05-14): iki ayrı KD katmanı.
+
+  # 1. Anchor → Oracle KD (Modül 1 mimarisinin kalbi)
+  #    Student encoder, Teacher CIR'ını tahmin etmeye çalışır.
+  #    Loss: L_kd_oracle = MSE(teacher_proj(student_latent), uwb_cir_oracle)
+  oracle_kd:
+    enabled: true
+    weight: 0.5                  # toplam loss'taki katsayı (λ)
+    teacher_target: "uwb_cir_oracle.npy"   # data/'dan okunur
+
+  # 2. Teacher → Student model damıtma (gecikme için)
+  #    Eğitim sonrası, ağır model bilgisini hafif Student'a aktar.
+  latency_distillation:
+    enabled: true
+    target_latency_ms: 200

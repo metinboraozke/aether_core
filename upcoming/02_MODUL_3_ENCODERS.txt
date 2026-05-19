@@ -1,0 +1,338 @@
+================================================================================
+MODÜL 3 — DUAL-STREAM ENCODER MİMARİSİ (THE EYES) — DETAYLI REHBER
+================================================================================
+Tarih: 2026-05-15
+Status: ✅ TAMAMLANDI 2026-05-15 — 3/3 dosya gerçek + __init__.py wrapper
+        Gerçek 5k veri ile birim test geçti.
+
+Implementasyon özet:
+  DualStreamEncoder = CSI Transformer + UWB 3-Tier + Cross-Attention + 3 aux
+  Toplam parametre:  2,483,216 (~2.5M)
+    csi_encoder:       1,275,680  (Transformer 4×8 layer, 192→256)
+    uwb_encoder:          68,416  (3-Tier light: Summary+CIR+CFR fuse)
+    slot_embedding:       99,584  (nn.Embedding + FiLM MLP)
+    cross_attention:     708,224  (MHA + FFN + 2 LN)
+    aux heads:           331,312  (training-only: path_csi, path_uwb, oracle_proj)
+  Forward (CPU, no_aux):  21 ms/sample
+  Forward (CPU, +aux):    27.6 ms toplam B=4 → 6.9 ms/sample
+  Output: slot_latent (B,6,256) + uwb_global (B,128) + csi_latent (B,28,256)
+  NaN/Inf: YOK, model stable
+  Backward: 89/135 parameter grad signal OK
+
+Bu dosya sonraki implementasyonlar için REFERANS olarak kalıyor.
+Detaylı kayıt: memory/project_decisions.md "2026-05-15 FAZ 2 TAMAMLANDI"
+
+HEDEF
+  PDF Modül 3'ün 3 alt mimarisini PyTorch ile implement:
+    A) CSI Transformer Encoder (WiFi tarafı)
+    B) 3-Tier UWB Encoder (UWB tarafı)
+    C) Cross-Stream Alignment (UWB-CSI füzyonu)
+  + auxiliary head'ler (path_aux, teacher_proj)
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) models/encoders/csi_encoder.py  (BÜYÜK — Transformer)
+   ─────────────────────────────────────────────────
+   Hedef: 28 link × 108 subcarrier CSI → 256-d slot-aware latent
+
+   Sınıflar:
+
+   class CSILinkEncoder(nn.Module):
+     """Per-link 1D-CNN. 108 subcarrier → 128-d feature."""
+     def __init__(self, in_channels=2, out_dim=128, n_subcarriers=108):
+       # in: (B, n_links, 2, 108)  → per-link 1D conv
+       # layers:
+       #   Conv1d(2, 32, kernel=7, padding=3) + ReLU
+       #   Conv1d(32, 64, kernel=5, padding=2) + ReLU + MaxPool(2)
+       #   Conv1d(64, 128, kernel=3, padding=1) + ReLU + AdaptiveAvgPool1d(1)
+       # out: (B, n_links, 128)
+
+   class LinkGeometryEmbed(nn.Module):
+     """Anten koordinatları [x, y, z] → 64-d geometry embedding."""
+     def __init__(self, in_dim=3, out_dim=64):
+       # MLP: Linear(3, 32) + ReLU + Linear(32, 64)
+       # in:  link_geo (B, n_links, 3)  ← yaml'dan node positions hesaplanır
+       # out: (B, n_links, 64)
+
+   class CSITransformerBlock(nn.Module):
+     """Standard transformer encoder block."""
+     def __init__(self, dim=192, n_heads=8, ff_dim=384, dropout=0.1):
+       # in_dim = 128 (csi feature) + 64 (geometry) = 192
+       # MultiHeadAttention + LayerNorm + FFN
+       # scale dot-product attention formülü (PDF):
+       #   Attn(Q,K,V) = softmax(QK^T / sqrt(d_k)) V
+       # 4 katman bu blok kullanılır
+
+   class CSITransformerEncoder(nn.Module):
+     """CSI Stream 1 ana sınıfı."""
+     def __init__(self,
+                  n_links=28, n_subcarriers=108,
+                  cnn_dim=128, geo_dim=64,
+                  transformer_layers=4, n_heads=8,
+                  out_dim=256):
+       self.link_encoder = CSILinkEncoder(out_dim=cnn_dim)
+       self.geo_embed = LinkGeometryEmbed(out_dim=geo_dim)
+       self.transformer = nn.Sequential(*[
+           CSITransformerBlock(dim=cnn_dim+geo_dim, n_heads=n_heads)
+           for _ in range(transformer_layers)
+       ])
+       self.proj = nn.Linear(cnn_dim+geo_dim, out_dim)
+
+     def forward(self, csi, link_geo):
+       # csi:      (B, 28, 2, 108)
+       # link_geo: (B, 28, 3)  ← link orta nokta veya TX-RX midpoint
+       link_feat = self.link_encoder(csi)       # (B, 28, 128)
+       geo_feat = self.geo_embed(link_geo)      # (B, 28, 64)
+       x = torch.cat([link_feat, geo_feat], -1) # (B, 28, 192)
+       x = self.transformer(x)                  # (B, 28, 192)
+       latent = self.proj(x)                    # (B, 28, 256)
+       return latent
+
+   PATH AUX HEAD (CSI tarafı):
+   class CSIPathAuxHead(nn.Module):
+     """Latent → path_params tahmin (DML-AP teacher hedefi)."""
+     def __init__(self, latent_dim=256, n_links=28, max_paths=20):
+       # MLP: latent (B, 28, 256) → (B, 28, 20*4) → reshape (B, 28, 20, 4)
+     def forward(self, csi_latent):
+       # in:  (B, 28, 256)
+       # out: (B, 28, 20, 4)  → MSE loss path_params_csi.npy ile
+
+
+2) models/encoders/uwb_encoder.py  (3-Tier — REVİZE 4→6 link)
+   ──────────────────────────────────────────────────────
+   Hedef: 6 bistatic CIR + 5 stat → 128-d UWB latent
+
+   Sınıflar:
+
+   class UWBSummaryMLP(nn.Module):
+     """Tier 1: 5 istatistik (range, RSSI, NLOS, ...) → 32-d."""
+     def __init__(self, in_dim=5, hidden=16, out_dim=32):
+       # Her bistatic link için 5 istatistik:
+       #   - mean energy
+       #   - peak amplitude
+       #   - first-path tap index (range göstergesi)
+       #   - rms delay spread
+       #   - NLOS bayrağı (peak/mean ratio < threshold)
+       # Per-link MLP, sonra global pool over links
+     def forward(self, cir):
+       # in:  (B, 6, 2, 32)
+       # out: (B, 32)
+
+   class UWBCIRBranch(nn.Module):
+     """Tier 2: 32 tap zaman domeni → 64-d (1D-CNN kernel=7)."""
+     def __init__(self, in_channels=2, out_dim=64, n_links=6):
+       # Conv1d(2, 32, k=7, pad=3) + ReLU
+       # Conv1d(32, 64, k=5, pad=2) + ReLU + AvgPool
+       # Conv1d(64, 64, k=3, pad=1) + ReLU + AdaptiveAvgPool1d(1)
+       # global pool over links
+     def forward(self, cir):
+       # in:  (B, 6, 2, 32)
+       # out: (B, 64)
+
+   class UWBCFRBranch(nn.Module):
+     """Tier 3: FFT alındıktan sonra 32 bin spektrum → 64-d (rezonatör)."""
+     def __init__(self, in_channels=2, out_dim=64):
+       # cir → complex → FFT → 32 bin
+       # Conv1d → 64-d
+       # PDF mantığı: rezonatör çentikleri burada görünür
+     def forward(self, cir):
+       # in:  (B, 6, 2, 32)
+       # out: (B, 64)
+
+   class UWBEncoder(nn.Module):
+     """3-Tier birleştirici, 32+64+64 → 128-d global UWB latent."""
+     def __init__(self, n_links=6, out_dim=128):
+       self.tier1 = UWBSummaryMLP()
+       self.tier2 = UWBCIRBranch()
+       self.tier3 = UWBCFRBranch()
+       self.fuse = nn.Linear(32+64+64, out_dim)
+     def forward(self, cir):
+       s1 = self.tier1(cir)
+       s2 = self.tier2(cir)
+       s3 = self.tier3(cir)
+       return self.fuse(torch.cat([s1, s2, s3], -1))   # (B, 128)
+
+   AUXILIARY HEAD'LER:
+
+   class UWBTeacherProjector(nn.Module):
+     """Anchor latent → Oracle CIR reconstruction (KD)."""
+     def __init__(self, latent_dim=128, n_slots=6, n_taps=32):
+       # MLP: 128 → 6*32*2 → reshape (B, 6, 32, 2)
+     def forward(self, uwb_latent):
+       return self.mlp(uwb_latent).view(-1, 6, 32, 2)
+       # MSE loss with uwb_cir_oracle.npy
+
+   class UWBPathAuxHead(nn.Module):
+     """Latent → bistatic path_params tahmin."""
+     def __init__(self, latent_dim=128, n_links=6, max_paths=20):
+       # MLP: 128 → 6*20*4 → reshape (B, 6, 20, 4)
+
+
+3) models/encoders/cross_attention.py
+   ─────────────────────────────────
+   Hedef: UWB ↔ CSI füzyon + 6 slot-specific latent
+
+   Sınıflar:
+
+   class UWBCSICrossAttention(nn.Module):
+     """UWB (Q) × CSI (K, V) cross-attention.
+
+     PDF mantığı: UWB net mesafe bilgisi 'sorgu', WiFi CSI 'anahtar/değer'.
+     Bu cross-attention modelin "arka plan gürültüsünü eleyip sadece
+     nesnenin olduğu mesafe aralığındaki WiFi değişimlerine odaklanması"nı
+     sağlar.
+     """
+     def __init__(self, uwb_dim=128, csi_dim=256, n_heads=4, out_dim=256):
+       # Q proj: uwb_latent → (B, 128) → tile to (B, 6_slot, 128)
+       # K, V proj: csi_latent (B, 28, 256) → (B, 28, out_dim)
+       # MultiHeadAttention(Q, K, V)
+     def forward(self, uwb_latent, csi_latent, slot_emb):
+       # uwb_latent: (B, 128)
+       # csi_latent: (B, 28, 256)
+       # slot_emb:   (B, 6, 128)  ← öğrenilebilir slot query'leri
+       # → her slot için cross-attention çıktısı (B, 6, out_dim)
+
+   class SlotEmbedding(nn.Module):
+     """6 slot için öğrenilebilir embedding + FiLM-style modulation."""
+     def __init__(self, n_slots=6, embed_dim=128):
+       self.slot_emb = nn.Parameter(torch.randn(n_slots, embed_dim))
+       # FiLM-style MLP: feature * gamma + beta
+       self.film_mlp = nn.Sequential(
+           nn.Linear(embed_dim, embed_dim * 2),
+           nn.ReLU(),
+           nn.Linear(embed_dim * 2, embed_dim * 2),  # gamma + beta
+       )
+     def forward(self, batch_size):
+       # out: slot_emb broadcast (B, n_slots, embed_dim)
+       return self.slot_emb.unsqueeze(0).expand(batch_size, -1, -1)
+
+     def modulate(self, features, slot_emb):
+       """FiLM modulation: features * gamma + beta."""
+       gamma_beta = self.film_mlp(slot_emb)   # (B, 6, 2*embed_dim)
+       gamma, beta = gamma_beta.chunk(2, -1)
+       return features * gamma + beta
+
+
+================================================================================
+ANA ENCODER WRAPPER (models/encoders/__init__.py)
+================================================================================
+
+class DualStreamEncoder(nn.Module):
+  """CSI + UWB tüm pipeline'ı birleştirir, 6 slot-specific latent verir."""
+  def __init__(self):
+    self.csi_enc = CSITransformerEncoder(out_dim=256)
+    self.uwb_enc = UWBEncoder(out_dim=128)
+    self.slot_emb = SlotEmbedding(n_slots=6, embed_dim=128)
+    self.cross_attn = UWBCSICrossAttention(uwb_dim=128, csi_dim=256)
+    # Auxiliary heads (training-time only)
+    self.csi_path_aux = CSIPathAuxHead(latent_dim=256)
+    self.uwb_path_aux = UWBPathAuxHead(latent_dim=128)
+    self.uwb_teacher_proj = UWBTeacherProjector(latent_dim=128)
+
+  def forward(self, csi, uwb, link_geo, return_aux=False):
+    csi_latent = self.csi_enc(csi, link_geo)     # (B, 28, 256)
+    uwb_latent = self.uwb_enc(uwb)               # (B, 128)
+    slot_q = self.slot_emb(csi.size(0))          # (B, 6, 128)
+    fused = self.cross_attn(uwb_latent, csi_latent, slot_q)  # (B, 6, 256)
+
+    out = {"slot_latent": fused, "uwb_global": uwb_latent}
+    if return_aux:
+      out["csi_path_pred"] = self.csi_path_aux(csi_latent)
+      out["uwb_path_pred"] = self.uwb_path_aux(uwb_latent)
+      out["uwb_oracle_pred"] = self.uwb_teacher_proj(uwb_latent)
+    return out
+
+
+================================================================================
+TENSOR SHAPE TABLOSU (BÜTÜN PIPELINE)
+================================================================================
+
+Input:
+  csi:       (B, 28, 2, 108)   ← preprocessing/tensor_format çıktısı
+  uwb:       (B, 6, 2, 32)
+  link_geo:  (B, 28, 3)
+
+Per-layer:
+  csi_link_feat:    (B, 28, 128)   ← CSILinkEncoder
+  csi_geo:          (B, 28, 64)    ← LinkGeometryEmbed
+  csi_with_geo:     (B, 28, 192)   ← concat
+  csi_transformed:  (B, 28, 192)   ← 4× Transformer
+  csi_latent:       (B, 28, 256)   ← proj
+
+  uwb_t1:           (B, 32)         ← Summary MLP
+  uwb_t2:           (B, 64)         ← CIR CNN
+  uwb_t3:           (B, 64)         ← CFR CNN
+  uwb_latent:       (B, 128)        ← fuse
+
+  slot_emb_broadcast: (B, 6, 128)
+  fused_slot:         (B, 6, 256)   ← Cross-Attention
+
+Auxiliary heads:
+  csi_path_pred:    (B, 28, 20, 4)  ← MSE with path_params_csi
+  uwb_path_pred:    (B, 6, 20, 4)   ← MSE with path_params_anchor
+  uwb_oracle_pred:  (B, 6, 32, 2)   ← MSE with uwb_cir_oracle
+
+
+================================================================================
+LOSS HESAPLAMA (TRAINING TIME)
+================================================================================
+
+# Ana task loss'ları Modül 4'te
+L_csi_path  = MSE(out['csi_path_pred'], gt_path_csi) * gt_validity_mask
+L_uwb_path  = MSE(out['uwb_path_pred'], gt_path_anchor) * gt_validity_mask
+L_kd_oracle = MSE(out['uwb_oracle_pred'], gt_oracle_cir)
+
+L_aux = λ_path * (L_csi_path + L_uwb_path) + λ_kd * L_kd_oracle
+
+
+================================================================================
+LİNK GEOMETRİSİ HESABI
+================================================================================
+
+scene.yaml'da nodes listesi var (M1..M4, S1..S4).
+link_pairs = combinations(range(8), 2)  → 28 link
+Her link için:
+  midpoint = (pos_i + pos_j) / 2   # (x, y, z) m cinsinden
+  veya normalize edilmiş yön vektörü
+
+Bu işlemi DataLoader içinde bir kez hesapla, batch'e tile et.
+
+
+================================================================================
+TEST DOSYASI (tests/test_encoders.py)
+================================================================================
+
+def test_csi_encoder():
+    enc = CSITransformerEncoder()
+    csi = torch.randn(2, 28, 2, 108)
+    geo = torch.randn(2, 28, 3)
+    out = enc(csi, geo)
+    assert out.shape == (2, 28, 256)
+
+def test_uwb_encoder():
+    enc = UWBEncoder()
+    cir = torch.randn(2, 6, 2, 32)
+    out = enc(cir)
+    assert out.shape == (2, 128)
+
+def test_dual_stream():
+    model = DualStreamEncoder()
+    out = model(torch.randn(2, 28, 2, 108),
+                torch.randn(2, 6, 2, 32),
+                torch.randn(2, 28, 3),
+                return_aux=True)
+    assert out['slot_latent'].shape == (2, 6, 256)
+    assert out['csi_path_pred'].shape == (2, 28, 20, 4)
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+  ~800 satır PyTorch
+  ~150 satır birim test
+  Tahmin: 2 mesaj (csi_encoder + uwb_encoder bir mesaj, cross_attention + dual_stream + auxiliary bir mesaj)
+
+BAĞIMLILIK: torch>=2.0

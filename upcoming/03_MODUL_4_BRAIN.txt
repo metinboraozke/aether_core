@@ -1,0 +1,372 @@
+================================================================================
+MODÜL 4 — HİYERARŞİK CASCADE DRI + VOXEL TAHMİNİ (THE BRAIN) — REHBER
+================================================================================
+Tarih: 2026-05-15
+Status: ✅ TAMAMLANDI 2026-05-15 — 5 head + tracker + fused_model gerçek
+        Gerçek 5k veri ile multi-task loss + backward test geçti.
+
+Implementasyon özet:
+  FusedCSIUWBNet: 2,912,289 parameter
+    encoder:        2,483,216
+    detection:          8,646
+    tsdf:             328,960  (Bayesian heteroscedastic)
+    recognition:       33,412
+    identification:    58,055  (triplet + BCE multi-task)
+    + SlidingTracker ayrı: ~150k parameter (TrackingEngine içinde state)
+
+  Inference (CPU, no_aux): 18 ms/sample
+  Multi-task loss (gerçek 5k veri):
+    detection      0.68
+    recognition    1.28
+    identification 1.33
+    tsdf           0.13
+    + aux: csi_path 0.04, uwb_path 0.06, kd_oracle 0.04
+  Backward: 153/157 parameter grad signal OK
+
+Detaylı kayıt: memory/project_decisions.md "2026-05-15 FAZ 3 TAMAMLANDI"
+
+HEDEF
+  PDF Modül 4'ün 5 başlığı + bunları birleştiren fused_model:
+    1) Detection (sparse ROI)
+    2) Bayesian TSDF Decoder (voxel μ + σ²)
+    3) Recognition (4-class material)
+    4) Identification (64-d L2-norm barcode + 7-bit Hamming codeword)
+    5) Tracker (sliding window mikro-Doppler) — SlidingTracker model class
+  + fused_model.py orkestratörü
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) models/heads/detection_head.py
+   ───────────────────────────────
+   Hedef: 6 slot için doluluk olasılığı (sigmoid).
+
+   class DetectionHead(nn.Module):
+     def __init__(self, in_dim=128, n_slots=6):
+       # PDF: UWB global latent (B, 128) → 6 sigmoid output
+       self.mlp = nn.Sequential(
+           nn.Linear(in_dim, 64), nn.ReLU(),
+           nn.Linear(64, n_slots)
+       )
+     def forward(self, uwb_global_latent):
+       # in:  (B, 128)
+       # out: dict {logits: (B, 6), prob: (B, 6), mask: (B, 6) bool @ thresh=0.5}
+       logits = self.mlp(uwb_global_latent)
+       prob = torch.sigmoid(logits)
+       mask = (prob > 0.5).float()
+       return {"logits": logits, "prob": prob, "mask": mask}
+
+   Loss: F.binary_cross_entropy_with_logits(logits, slot_labels.float())
+
+   Bağımlılık: torch
+
+
+2) models/heads/tsdf_decoder.py
+   ────────────────────────────
+   Hedef: Voxel grid başına Bayesian (μ doluluk, σ² belirsizlik).
+
+   class BayesianTSDFDecoder(nn.Module):
+     """Slot başına 8×8×8 voxel grid → μ, σ² (Bayesian)."""
+     def __init__(self,
+                  in_dim=256, n_slots=6,
+                  voxel_grid=(8, 8, 8)):
+       self.n_voxels = voxel_grid[0]*voxel_grid[1]*voxel_grid[2]   # 512
+       # Per-slot decoder MLP
+       self.mu_head = nn.Sequential(
+           nn.Linear(in_dim, 256), nn.ReLU(),
+           nn.Linear(256, self.n_voxels)
+       )
+       self.logvar_head = nn.Sequential(
+           nn.Linear(in_dim, 256), nn.ReLU(),
+           nn.Linear(256, self.n_voxels)
+       )
+     def forward(self, slot_latent):
+       # in:  (B, 6, 256)
+       # out: dict {mu: (B, 6, 8, 8, 8), sigma2: (B, 6, 8, 8, 8)}
+
+   Loss: Gaussian NLL veya basit MSE(μ, voxel_label) + KL(σ²|prior)
+   NOT: voxel_label sentetik tarafta basitçe slot dolu/boş × voxel maskesi.
+
+   Bağımlılık: torch
+
+
+3) models/heads/recognition_head.py
+   ────────────────────────────────
+   Hedef: 4-class malzeme sınıflandırma (Metal/Plastik/Ahşap/Karton).
+
+   class RecognitionHead(nn.Module):
+     def __init__(self, in_dim=256, n_classes=4, n_slots=6):
+       self.mlp = nn.Sequential(
+           nn.Linear(in_dim, 128), nn.ReLU(),
+           nn.Linear(128, n_classes)
+       )
+     def forward(self, slot_latent):
+       # in:  (B, 6, 256)
+       # out: (B, 6, 4) logits
+
+   Loss (masked CE, sadece ROI):
+     def masked_cross_entropy(logits, labels, roi_mask):
+       # logits: (B, 6, 4), labels: (B, 6), roi_mask: (B, 6)
+       loss = F.cross_entropy(logits.view(-1, 4),
+                              labels.view(-1).long(),
+                              reduction='none')
+       loss = loss.view(B, 6) * roi_mask
+       return loss.sum() / roi_mask.sum().clamp_min(1.0)
+
+   NOT: labels 0=boş (zaten roi_mask=0), 1=metal, 2=plastik, 3=ahşap, 4=karton
+        → model class index sırası 0..3 için labels-1 yap, veya boş slot
+          için "ignore_index=0" CE kullan. Önerilen: labels - 1 → 0..3.
+
+
+4) models/heads/identification_head.py
+   ────────────────────────────────────
+   Hedef: 64-d L2-norm latent + 7-bit Hamming codeword tahmin.
+
+   class IdentificationHead(nn.Module):
+     def __init__(self, in_dim=256, latent_dim=64, codeword_bits=7):
+       self.latent_proj = nn.Sequential(
+           nn.Linear(in_dim, 128), nn.ReLU(),
+           nn.Linear(128, latent_dim)
+       )
+       self.codeword_proj = nn.Sequential(
+           nn.Linear(in_dim, 64), nn.ReLU(),
+           nn.Linear(64, codeword_bits)
+       )
+     def forward(self, slot_latent):
+       latent = self.latent_proj(slot_latent)
+       latent = F.normalize(latent, p=2, dim=-1)  # L2-norm
+       codeword_logits = self.codeword_proj(slot_latent)
+       return {"latent_64d": latent, "codeword_logits": codeword_logits}
+
+   Loss (multi-task):
+     L_triplet = TripletMarginLoss()(anchor, positive, negative)
+     L_bce = F.binary_cross_entropy_with_logits(codeword_logits, codeword_labels.float())
+     L_id = L_triplet + 0.5 * L_bce
+     # mask ROI
+
+   ID lookup (inference):
+     def cosine_lookup(latent_64d, db_signatures, top_k=1):
+       sim = F.cosine_similarity(latent_64d.unsqueeze(1),
+                                 db_signatures.unsqueeze(0), dim=-1)
+       return sim.topk(top_k, dim=-1)
+
+   Hamming decode (inference):
+     def hamming_decode(codeword_logits):
+       bits = (codeword_logits > 0).int()  # sigmoid > 0.5
+       # backend or resonator_inject.hamming_decode_7_4(bits) çağır
+       return decoded_4bit_id
+
+   Triplet mining: batch içinden aynı codeword'lü pozitif, farklı negatif örnekle.
+
+
+5) models/heads/tracker.py  (KISMEN HAZIR)
+   ─────────────────────────────────────
+   DopplerRingBuffer + TrackingEngine GERÇEK.
+   SlidingTracker model class TODO blok hazır (string olarak).
+
+   YAPILACAK: SlidingTracker class'ını PyTorch ile gerçek yaz.
+
+   class SlidingTracker(nn.Module):
+     def __init__(self, window_size=100, n_motion_classes=3):
+       # n_motion_classes: insan / forklift / statik
+       # Layers:
+       #   1) DC sub (mean subtract over T axis)
+       #   2) FFT zaman ekseninde → Doppler spektrum
+       #   3) 2D-CNN (Doppler-bin × link)
+       #   4) Global pool → latent
+       #   5) 3 head
+       self.cnn = nn.Sequential(
+           nn.Conv2d(2, 32, kernel_size=(3, 3), padding=1), nn.ReLU(),
+           nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1), nn.ReLU(),
+           nn.AdaptiveAvgPool2d((1, 1))
+       )
+       self.flatten = nn.Flatten()
+       self.presence_head = nn.Linear(64, 1)
+       self.class_head = nn.Linear(64, n_motion_classes)
+       self.velocity_head = nn.Linear(64, 3)
+
+     def forward(self, csi_window):
+       # csi_window: (B, T=100, 28, 108, 2)
+       x = csi_window - csi_window.mean(dim=1, keepdim=True)   # DC sub
+       # FFT zaman ekseninde
+       x_fft = torch.fft.fft(torch.complex(x[..., 0], x[..., 1]), dim=1)
+       x_mag = torch.abs(x_fft)        # (B, T, 28, 108)
+       # 2D CNN: reshape (B, 2, T, 28*108) veya benzer
+       # ... feature extraction ...
+       latent = self.flatten(self.cnn(x_mag.transpose(1, 2)))   # (B, 64)
+       return {
+           "presence": self.presence_head(latent),       # (B, 1)
+           "class": self.class_head(latent),             # (B, 3)
+           "velocity": self.velocity_head(latent),       # (B, 3)
+       }
+
+   TrackingEngine'in `step()` metodunda model=SlidingTracker() ile çağırılır.
+
+   Loss:
+     L_presence = BCE(presence, gt_presence)
+     L_class    = CE(class, gt_motion_class)
+     L_velocity = MSE(velocity, gt_velocity)
+     L_track    = L_presence + 0.5 * L_class + 0.3 * L_velocity
+
+
+6) models/fused_model.py
+   ────────────────────
+   Hedef: Encoder + 5 head birleştirici ana sınıf.
+
+   class FusedCSIUWBNet(nn.Module):
+     def __init__(self, n_slots=6, n_materials=4):
+       self.encoder = DualStreamEncoder()
+       self.detection = DetectionHead(in_dim=128, n_slots=n_slots)
+       self.tsdf = BayesianTSDFDecoder(in_dim=256, n_slots=n_slots)
+       self.recognition = RecognitionHead(in_dim=256, n_classes=n_materials)
+       self.identification = IdentificationHead(in_dim=256)
+       # tracker ayrı yönetilir (sliding window state'i var)
+       # self.tracker = SlidingTracker(...)
+
+     def forward(self, csi, uwb, link_geo, return_aux=False):
+       # 1) Encoder
+       enc_out = self.encoder(csi, uwb, link_geo, return_aux=return_aux)
+       slot_latent = enc_out["slot_latent"]       # (B, 6, 256)
+       uwb_global  = enc_out["uwb_global"]        # (B, 128)
+
+       # 2) Detection (UWB global)
+       det = self.detection(uwb_global)
+       roi_mask = det["mask"]                     # (B, 6)
+
+       # 3) TSDF (slot-aware, tüm slotlar için)
+       tsdf = self.tsdf(slot_latent)              # μ, σ²
+
+       # 4) Recognition (sadece ROI mask uygulanacak loss'ta)
+       rec_logits = self.recognition(slot_latent)  # (B, 6, 4)
+
+       # 5) Identification
+       ident = self.identification(slot_latent)
+
+       out = {
+         "detection_logits": det["logits"],
+         "detection_mask": det["mask"],
+         "tsdf_mu": tsdf["mu"], "tsdf_sigma2": tsdf["sigma2"],
+         "material_logits": rec_logits,
+         "barcode_latent": ident["latent_64d"],
+         "barcode_codeword": ident["codeword_logits"],
+       }
+       if return_aux:
+         out.update({
+           "csi_path_pred": enc_out["csi_path_pred"],
+           "uwb_path_pred": enc_out["uwb_path_pred"],
+           "uwb_oracle_pred": enc_out["uwb_oracle_pred"],
+         })
+       return out
+
+     def compute_loss(self, out, labels, lambdas=None):
+       """Çoklu loss hesabı. Lambdas dict ile ağırlıklar."""
+       # ...
+
+
+================================================================================
+TENSOR SHAPE TABLOSU (UÇTAN UCA)
+================================================================================
+
+Input:
+  csi:       (B, 28, 2, 108)
+  uwb:       (B, 6, 2, 32)
+  link_geo:  (B, 28, 3)
+
+Labels:
+  slot_labels:      (B, 6)
+  material_labels:  (B, 6)
+  codeword_labels:  (B, 6, 7)
+
+Encoder:
+  slot_latent:      (B, 6, 256)
+  uwb_global:       (B, 128)
+
+Heads:
+  detection_logits: (B, 6)
+  detection_mask:   (B, 6)
+  tsdf_mu:          (B, 6, 8, 8, 8)
+  tsdf_sigma2:      (B, 6, 8, 8, 8)
+  material_logits:  (B, 6, 4)
+  barcode_latent:   (B, 6, 64)
+  barcode_codeword: (B, 6, 7)
+
+Tracker (ayrı):
+  presence:         (B, 1)
+  class:            (B, 3)
+  velocity:         (B, 3)
+
+
+================================================================================
+TOPLAM LOSS
+================================================================================
+
+def total_loss(out, labels, aux_targets=None, lambdas=DEFAULT_LAMBDAS):
+    # Ana task'lar
+    L_det = F.bce_with_logits(out["detection_logits"], labels["slot"].float())
+    L_rec = masked_cross_entropy(out["material_logits"],
+                                 labels["material"], labels["slot"])
+    L_id  = identification_loss(out["barcode_latent"],
+                                out["barcode_codeword"],
+                                labels["codeword"],
+                                labels["slot"])
+    L_tsdf = tsdf_loss(out["tsdf_mu"], out["tsdf_sigma2"], labels["slot"])
+
+    L_main = (L_det
+              + lambdas["recognition"] * L_rec
+              + lambdas["identification"] * L_id
+              + lambdas["tsdf"] * L_tsdf)
+
+    # Auxiliary
+    L_aux = 0.0
+    if aux_targets is not None:
+      L_aux += lambdas["csi_path"] * masked_mse(
+                  out["csi_path_pred"], aux_targets["path_csi"])
+      L_aux += lambdas["uwb_path"] * masked_mse(
+                  out["uwb_path_pred"], aux_targets["path_uwb"])
+      L_aux += lambdas["kd_oracle"] * F.mse_loss(
+                  out["uwb_oracle_pred"], aux_targets["oracle_cir"])
+
+    return L_main + L_aux
+
+
+================================================================================
+DEFAULT LAMBDAS (configs/training.yaml içine eklenir)
+================================================================================
+lambdas:
+  recognition: 1.0
+  identification: 1.0
+  tsdf: 0.3
+  csi_path: 0.3      # warmup ramp
+  uwb_path: 0.3
+  kd_oracle: 0.5
+
+
+================================================================================
+TEST DOSYASI (tests/test_brain.py)
+================================================================================
+
+def test_fused_model_forward():
+    model = FusedCSIUWBNet()
+    out = model(torch.randn(2, 28, 2, 108),
+                torch.randn(2, 6, 2, 32),
+                torch.randn(2, 28, 3),
+                return_aux=True)
+    assert out["detection_mask"].shape == (2, 6)
+    assert out["material_logits"].shape == (2, 6, 4)
+    assert out["barcode_latent"].shape == (2, 6, 64)
+    assert out["barcode_codeword"].shape == (2, 6, 7)
+    assert out["tsdf_mu"].shape == (2, 6, 8, 8, 8)
+    assert out["csi_path_pred"].shape == (2, 28, 20, 4)
+    assert out["uwb_oracle_pred"].shape == (2, 6, 32, 2)
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+  ~700 satır PyTorch
+  ~200 satır birim test
+  Tahmin: 2 mesaj (5 head + SlidingTracker bir mesaj, fused_model + loss bir mesaj)
+
+BAĞIMLILIK: torch, ürettiğimiz models/encoders/* (Modül 3'ten önce yazılamaz)

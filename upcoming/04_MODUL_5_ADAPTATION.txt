@@ -1,0 +1,275 @@
+================================================================================
+MODÜL 5 — SIM-TO-REAL ADAPTASYONU (THE BRIDGE) — REHBER
+================================================================================
+Tarih: 2026-05-15
+Status: ✅ TAMAMLANDI 2026-05-15 — 3 dosya + __init__ gerçek
+        Birim test geçti (synthetic + FusedCSIUWBNet ile entegrasyon).
+
+Implementasyon özet:
+  DANN:
+    GradientReversalFn (custom autograd): backward = -lambda * grad
+    grl_lambda_schedule: warmup 3 epoch → ramp (alpha=5) → cap 0.7
+    DomainDiscriminator: 128-d → binary (slot-level mean pool destekli)
+    DANNWrapper: encoder feature → GRL → disc → BCE loss
+
+  ResidualAdapter:
+    Zero-init (initial output == input, identity)
+    scale = 0.1 baslangic (öğrenilebilir nn.Parameter)
+    Bottleneck MLP (dim → 64 → dim)
+
+  Freeze utils:
+    freeze_encoder: encoder freeze, adapter+heads serbest
+    unfreeze_all: reset
+    count_trainable: debug
+
+  Distillation:
+    LightCSIEncoder + LightUWBEncoder + StudentFusedNet (605k param)
+    Teacher (2.91M) → Student (605k) = 4.8x sıkıştırma
+    Student CPU inference: 11.75 ms/sample (1.5x hız)
+    distillation_loss: alpha_repr (0.3) + alpha_logit (0.4, T=4) + alpha_hard (0.3)
+    Şu an train_phase1/2/distillation NotImplementedError → Modül 6'da doldurulacak
+
+Detaylı kayıt: memory/project_decisions.md "2026-05-15 FAZ 4 TAMAMLANDI"
+
+HEDEF
+  PDF Modül 5 Adım 1-2-5'i implement:
+    1) DANN (Gradient Reversal Layer + Domain Discriminator)
+    2) Residual Adapter + iki fazlı fine-tune (Phase 1 etiketsiz, Phase 2 etiketli)
+    5) Knowledge Distillation (Teacher → Student, gecikme < 200 ms)
+
+  NOT: Modül 5 Adım 3 (Real-Time iletişim) ve Adım 4 (Three.js dashboard)
+       backend ve dashboard'da ele alınır → 05_BACKEND_DASHBOARD.txt
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) adaptation/dann.py
+   ──────────────────
+   Hedef: Gradient Reversal Layer + Domain Discriminator.
+
+   class GradientReversalFn(torch.autograd.Function):
+     """GRL: forward = identity, backward = -λ * grad."""
+     @staticmethod
+     def forward(ctx, x, lambda_):
+       ctx.lambda_ = lambda_
+       return x.view_as(x)
+     @staticmethod
+     def backward(ctx, grad_output):
+       return -ctx.lambda_ * grad_output, None
+
+   def grad_reverse(x, lambda_=1.0):
+     return GradientReversalFn.apply(x, lambda_)
+
+   def grl_lambda_schedule(progress: float,
+                            alpha: float = 5.0,    # REVİZE: 10→5 yumuşak ramp
+                            warmup_p: float = 0.1,  # ilk %10 λ=0
+                            max_lambda: float = 0.7  # cap (1.0 yerine)
+                           ) -> float:
+     """progress ∈ [0, 1]. Warmup + sigmoid ramp + cap."""
+     if progress < warmup_p:
+       return 0.0
+     p = (progress - warmup_p) / (1.0 - warmup_p)
+     l = 2.0 / (1.0 + math.exp(-alpha * p)) - 1.0
+     return min(l, max_lambda)
+
+   class DomainDiscriminator(nn.Module):
+     """Latent → domain logit (0=Sionna sentetik, 1=gerçek ESP32)."""
+     def __init__(self, in_dim=256, hidden=128):
+       self.mlp = nn.Sequential(
+           nn.Linear(in_dim, hidden), nn.ReLU(),
+           nn.Linear(hidden, hidden), nn.ReLU(),
+           nn.Linear(hidden, 1)   # binary classification logit
+       )
+     def forward(self, latent):
+       return self.mlp(latent).squeeze(-1)
+
+   class DANNWrapper:
+     """Encoder + Discriminator orchestrasyon."""
+     def __init__(self, encoder, discriminator, max_lambda=0.7):
+       self.encoder = encoder
+       self.discriminator = discriminator
+       self.max_lambda = max_lambda
+
+     def forward(self, x, domain_labels, progress=0.0):
+       latent = self.encoder(x)
+       lambda_ = grl_lambda_schedule(progress, max_lambda=self.max_lambda)
+       reversed_latent = grad_reverse(latent, lambda_)
+       domain_logits = self.discriminator(reversed_latent)
+       L_domain = F.binary_cross_entropy_with_logits(
+           domain_logits, domain_labels.float())
+       return latent, L_domain, lambda_
+
+   Loss entegrasyonu:
+     L_total = L_main_tasks + L_domain   # GRL otomatik -λ*grad uygular
+
+   BAĞIMLILIK: torch, configs/training.yaml runtime.dann_max_lambda
+
+   TEST:
+     def test_grl():
+       x = torch.randn(4, 256, requires_grad=True)
+       y = grad_reverse(x, lambda_=0.5)
+       y.sum().backward()
+       assert torch.allclose(x.grad, -0.5 * torch.ones_like(x.grad))
+
+
+2) adaptation/residual_adapter.py
+   ──────────────────────────────
+   Hedef: x + scale * adapter(x) yapısı, Phase 1/2 fine-tune.
+
+   class ResidualAdapter(nn.Module):
+     """Encoder içine sokulan hafif adapter katmanı.
+
+     Adapter formülü: çıktı = x + scale * adapter(x)
+     scale_init = 0.1 (modelin bilgisi korunur, küçük perturbation)
+     """
+     def __init__(self, dim, hidden=64, scale_init=0.1):
+       self.scale = nn.Parameter(torch.tensor(scale_init))
+       self.mlp = nn.Sequential(
+           nn.Linear(dim, hidden), nn.ReLU(),
+           nn.Linear(hidden, dim)
+       )
+     def forward(self, x):
+       return x + self.scale * self.mlp(x)
+
+   def freeze_encoder(model: nn.Module) -> None:
+     """Phase 2: encoder parameter'larını dondur, sadece adapter eğitilir."""
+     for name, p in model.named_parameters():
+       if "adapter" not in name and "head" not in name:
+         p.requires_grad = False
+
+   def unfreeze_encoder(model: nn.Module) -> None:
+     for p in model.parameters():
+       p.requires_grad = True
+
+   # Phase loop'ları
+   def train_phase1(model, unlabeled_real_loader, sim_loader, epochs):
+     """Etiketsiz ön eğitim — sadece adversarial + contrastive."""
+     # losses: DANN + UWB-CSI contrastive alignment
+     # encoder serbest, head'ler aktif değil
+     pass
+
+   def train_phase2(model, labeled_real_loader, epochs):
+     """Etiketli ince ayar — recognition + detection."""
+     freeze_encoder(model)
+     # sadece adapter + head'ler eğitilir
+     # task losses (recognition + detection)
+     pass
+
+   Adapter insertion noktaları (DualStreamEncoder içine):
+     - CSITransformerEncoder'ın proj çıkışından sonra
+     - UWBEncoder'ın fuse çıkışından sonra
+     - Cross-Attention sonrası slot_latent üzerine
+
+   Default: 3 adapter katmanı, hepsi scale_init=0.1.
+
+
+3) adaptation/distillation.py
+   ──────────────────────────
+   Hedef: Teacher-Student knowledge distillation (latency < 200 ms).
+
+   class StudentModel(nn.Module):
+     """FusedCSIUWBNet'in light variant'i."""
+     def __init__(self):
+       # Encoder daha küçük: csi_dim 192→96, transformer_layers 4→2
+       # UWB 3-Tier yerine tek-stage MLP
+       # Aynı head'ler ama in_dim küçük
+       pass
+
+   def distill_loss(student_out, teacher_out, T=4.0, alpha=0.5):
+     """Standart KD loss.
+
+     L_kd = T² * KL(softmax(s/T) || softmax(t/T))
+     L_hard = CE(student, gt_label)
+     L_total = alpha * L_kd + (1-alpha) * L_hard
+     """
+     # Sadece detection ve recognition için (TSDF/identification ayrı)
+     pass
+
+   def train_distillation(teacher, student, loader, epochs):
+     teacher.eval()
+     for epoch in range(epochs):
+       for batch in loader:
+         with torch.no_grad():
+           t_out = teacher(**batch)
+         s_out = student(**batch)
+         loss = distill_loss(s_out, t_out)
+         loss.backward()
+         # optimizer step
+
+   Latency hedef:
+     student forward pass < 50 ms (CPU/GPU)
+     + preprocessing < 50 ms
+     + WS overhead < 100 ms
+     Toplam < 200 ms ✓
+
+   Inference'ta Student kullanılır (FastAPI inference_server.py'de).
+
+
+================================================================================
+ENTEGRASYON SIRASI
+================================================================================
+
+  1. FAZ 1 — Sentetik veri ile baseline:
+       train_supervised(FusedCSIUWBNet, sim_data, epochs=20)
+       → checkpoint_sim.pt
+
+  2. FAZ 2A — DANN ile sentetik + (etiketsiz) gerçek:
+       sim_loader + real_unlabeled_loader
+       train_dann(FusedCSIUWBNet, ..., epochs=10, grl_max_lambda=0.7)
+       → checkpoint_dann.pt
+
+  3. FAZ 2B — Residual adapter Phase 1:
+       train_phase1(..., epochs=5)
+       → checkpoint_phase1.pt
+
+  4. FAZ 2C — Residual adapter Phase 2 (etiketli gerçek veri):
+       train_phase2(..., epochs=5)
+       → checkpoint_phase2.pt
+
+  5. FAZ 3 — Knowledge Distillation:
+       train_distillation(teacher=checkpoint_phase2, student=StudentModel(), epochs=10)
+       → checkpoint_student.pt   ← INFERENCE'ta kullanılır
+
+
+================================================================================
+CONFIGS/TRAINING.YAML EKLEME
+================================================================================
+
+# Mevcut domain_adaptation + residual_adapter + phases blokları YETERLİ.
+# Bu modülde implementasyon tarafında değişiklik gerekmez (params zaten yaml'da).
+
+
+================================================================================
+TEST DOSYASI (tests/test_adaptation.py)
+================================================================================
+
+def test_grl_lambda_schedule():
+    assert grl_lambda_schedule(0.0) == 0.0   # warmup
+    assert grl_lambda_schedule(0.05) == 0.0  # warmup
+    assert 0.0 < grl_lambda_schedule(0.5) < 0.7
+    assert grl_lambda_schedule(1.0) == 0.7   # cap
+
+def test_residual_adapter_init():
+    ad = ResidualAdapter(dim=256)
+    x = torch.randn(2, 256)
+    y = ad(x)
+    # scale 0.1 → küçük perturbation
+    assert torch.allclose(x, y, atol=0.3)
+
+def test_freeze_encoder():
+    model = FusedCSIUWBNet()
+    freeze_encoder(model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert len(trainable) > 0  # adapter + head'ler
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+  ~500 satır PyTorch
+  ~100 satır birim test
+  1 mesaj
+
+BAĞIMLILIK: torch, models/fused_model.py (Modül 4'ten sonra)

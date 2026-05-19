@@ -1,0 +1,287 @@
+================================================================================
+AETHER CORE — KALAN ADIMLAR YOL HARITASI
+================================================================================
+Tarih başlangıç: 2026-05-15
+Strateji: B yolu (mini veri → modül modül implement)
+Bu klasör: her adımdan sonra GÜNCELLENİR, implementation için referans.
+
+
+================================================================================
+GENEL DURUM
+================================================================================
+
+TAMAM (gerçek çalışan kod):
+  + data_synthesis/generate_hybrid_sionna.py       (UWB Round-Robin TDMA)
+  + data_synthesis/generate_wifi_csi_sionna.py     (WiFi 28 link batched)
+  + data_synthesis/resonator_inject.py             (Hamming 7,4 + Lorentzian)
+  + data_synthesis/noise_models.py                 (AGC, CFO, AWGN, vs)
+  + preprocessing/differential_csi.py              (AdaptiveBaseline B+A)
+  + preprocessing/phase_sanitize.py                (unwrap+linear+offset) ✓ 2026-05-15
+  + preprocessing/agc_normalize.py                 (RMS+clip+dB) ✓ 2026-05-15
+  + preprocessing/dwt_denoise.py                   (PyWavelets soft-thresh) ✓ 2026-05-15
+  + preprocessing/uwb_resample.py                  (sinc+align+window) ✓ 2026-05-15
+  + preprocessing/tensor_format.py                 (reshape+minmax+tau norm) ✓ 2026-05-15
+  + preprocessing/__init__.py                      (preprocess_csi/uwb/path wrapper) ✓ 2026-05-15
+  + models/heads/tracker.py                        (DopplerRingBuffer + Engine)
+  + backend/sync_buffer.py                         (MultiSensorSyncBuffer)
+  + 5 scene.yaml (hibrit topoloji)
+  + 5 Mitsuba XML
+  + COLAB_RUN.txt
+  + README.md
+
+  ** FAZ 1 (MODUL 2 PREPROCESSING) TAMAMLANDI 2026-05-15 **
+     Gerçek 5k veri ile birim test geçti
+     preprocess_csi:  8.46 ms/sample (200 ms budget içinde rahat)
+     preprocess_uwb:  0.18 ms/sample
+     End-to-end output: (B, 28, 2, 108) + (B, 6, 2, 32), range [-1, 1]
+
+  + models/encoders/csi_encoder.py                 (Transformer + PathAux) ✓ 2026-05-15
+  + models/encoders/uwb_encoder.py                 (3-Tier + Teacher + PathAux) ✓ 2026-05-15
+  + models/encoders/cross_attention.py             (CrossAttn + SlotEmb FiLM) ✓ 2026-05-15
+  + models/encoders/__init__.py                    (DualStreamEncoder wrapper) ✓ 2026-05-15
+
+  ** FAZ 2 (MODUL 3 ENCODERS) TAMAMLANDI 2026-05-15 **
+     DualStreamEncoder: 2.48M parameter (CPU ~21 ms/sample inference)
+     Forward pass: synthetic + gerçek 5k veri OK, NaN/Inf yok
+     Output: slot_latent (B,6,256) + uwb_global (B,128) + 3 aux head
+     Bütçe: preprocess (8.65) + encoder (21.0) = 29.7 ms (200 ms hedefine rahat)
+
+  + models/heads/detection_head.py                 (sigmoid ROI + BCE) ✓ 2026-05-15
+  + models/heads/tsdf_decoder.py                   (Bayesian μ+σ², NLL) ✓ 2026-05-15
+  + models/heads/recognition_head.py               (4-class masked CE) ✓ 2026-05-15
+  + models/heads/identification_head.py            (latent_64d + 7-bit, triplet+BCE) ✓ 2026-05-15
+  + models/heads/tracker.py                        (+ SlidingTracker 2D-CNN Doppler) ✓ 2026-05-15
+  + models/heads/__init__.py                       (paket exports) ✓ 2026-05-15
+  + models/fused_model.py                          (FusedCSIUWBNet + compute_loss) ✓ 2026-05-15
+
+  ** FAZ 3 (MODUL 4 BRAIN) TAMAMLANDI 2026-05-15 **
+     FusedCSIUWBNet: 2.91M parameter (encoder 2.48M + heads 0.43M)
+     Inference (CPU, no_aux): 18 ms/sample
+     Bütçe: preprocess (8.65) + encoder+heads (18.1) = 26.7 ms (200 ms hedefine OK)
+     Multi-task loss gerçek 5k veri ile: det 0.68, rec 1.28, id 1.33, tsdf 0.13
+                                          + aux (csi_path 0.04, uwb_path 0.06, kd 0.04)
+     Backward: 153/157 param gradient signal
+     SlidingTracker WARMING_UP → OK geçişi calisiyor
+
+  + adaptation/dann.py                             (GRL + Disc + lambda warmup+cap) ✓ 2026-05-15
+  + adaptation/residual_adapter.py                 (Adapter zero-init + freeze API) ✓ 2026-05-15
+  + adaptation/distillation.py                     (LightCSI/UWB + StudentFusedNet + KD loss) ✓ 2026-05-15
+  + adaptation/__init__.py                         (paket exports) ✓ 2026-05-15
+
+  ** FAZ 4 (MODUL 5 ADAPTATION) TAMAMLANDI 2026-05-15 **
+     GRL backward: -lambda * grad doğrulandı (lambda=0.5 → grad=-0.5)
+     Lambda schedule: warmup 0.0→0.1 (lambda=0), ramp 0.1→0.5 (0→0.7), cap 0.7
+     DomainDiscriminator: 128-d input → binary logit, slot-level mean pool OK
+     ResidualAdapter: zero-init → initial output == input (identity), scale=0.1
+     freeze_encoder: 2,483,216 frozen / 429,073 trainable (adapter + heads)
+     StudentFusedNet: 605,985 parameter (4.8x sıkıştırma)
+     Student inference CPU: 11.75 ms/sample (1.5x hız kazancı)
+     KD loss: repr (MSE), logit (KL+BCE, T=4), hard (CE) — backward OK 105/119
+
+  + backend/inference_server.py                    (InferenceEngine async tick) ✓ 2026-05-15
+  + backend/ws_stream.py                           (/ws/ingest + /ws/predict) ✓ 2026-05-15
+  + backend/main.py                                (FastAPI app + lifespan) ✓ 2026-05-15
+  + dashboard/index.html                           (Three.js + HUD) ✓ 2026-05-15
+  + dashboard/voxel_renderer.js                    (InstancedMesh 3072 voxel) ✓ 2026-05-15
+  + dashboard/main.js                              (Scene + OrbitControls + WS) ✓ 2026-05-15
+
+  ** FAZ 5 (BACKEND + DASHBOARD) TAMAMLANDI 2026-05-15 **
+     FastAPI app: 4 HTTP endpoint (/, /telemetry, /reset_baseline, /openapi.json/docs)
+                  2 WS endpoint (/ws/ingest, /ws/predict)
+                  Lifespan: startup (engine.start) + shutdown (engine.stop + baseline save)
+                  CORS enabled, env vars: AETHER_CHECKPOINT, DEVICE, USE_STUDENT
+     InferenceEngine: master tick 50 ms, sync_buffer + baseline + preprocess + model + tracker
+                       MOCK mode (model=None) + real model destekli
+                       step_one_tick() manuel test için
+     Real model tick (CPU): 144 ms (preprocess+forward+tracker, 200 ms hedef içinde)
+     Dashboard: 3072 voxel (6 slot × 8x8x8) InstancedMesh, opacity=μ, color=material,
+                glow=σ², HUD: FPS/inference_ms/slot status/legend
+                WS auto-reconnect, OrbitControls, Three.js 0.161 (CDN importmap)
+     Birim test: FastAPI app + 9 route, mock tick PACKET döndü, real model 144ms
+
+  + data_synthesis/multi_domain_dataset.py         (MultiDomainDataset + collate) ✓ 2026-05-19
+  + training/eval.py                               (det/rec/id metrik + evaluate) ✓ 2026-05-19
+  + training/train.py                              (train_baseline + train_dann + distill CLI) ✓ 2026-05-19
+  + training/ablation.py                           (5 varyant runner + JSON dump) ✓ 2026-05-19
+  + training/__init__.py                           (paket exports) ✓ 2026-05-19
+
+  + data_synthesis/layout_variants.py             (generate + assign + jitter) ✓ 2026-05-19
+  + data_synthesis/generate_hybrid_sionna.py      (UWB variant rotation main loop) ✓ 2026-05-19
+  + data_synthesis/generate_wifi_csi_sionna.py    (WiFi variant rotation main loop) ✓ 2026-05-19
+  + data_synthesis/multi_domain_dataset.py        (layout-aware __getitem__) ✓ 2026-05-19
+
+  ** FAZ 0.5 (SENSOR PLACEMENT RANDOMIZATION) TAMAMLANDI 2026-05-19 **
+     generate_layout_variants: 8 düğüm × N variant gaussian jitter + oda clip
+       - v=0 base identity (backward compat)
+       - v>=1 deterministic per-variant seed (seed + 1000*v)
+     UWB + WiFi script main() loop: sample → layout_id → cfg_variant
+     Çıktı: layout_ids.npy + layout_meta.yaml + layout_ids_wifi.npy
+     MultiDomainDataset: layout-aware link_geo (sample.layout_id → variants[lid])
+     Backward compat: eski 5k veri (layout_ids.npy yok) hâlâ çalışıyor (lid=0 default)
+     Birim test:
+       - layout_variants modülü: identity, jitter+clip, determinism, contiguous IDs
+       - 5k eski veri: 5000 sample yükledi, hepsinin layout_id=0
+       - Mock 1k × 5 variant: s0 vs s500 link_geo farkı ~35 cm, intra-variant fark = 0
+     COLAB güncelleme: N_VARIANTS=5, LAYOUT_JITTER_XY=0.3, LAYOUT_JITTER_Z=0.1
+     Production hedef: 5 preset × 5 variant × 20k = 500k toplam
+
+  ** FAZ 6 (MODUL 6 TRAINING + ABLATION) TAMAMLANDI 2026-05-19 **
+     MultiDomainDataset: 5 preset memmap (5000 sample), domain_id + aux + cached link_geo
+     collate_with_preprocess: batch-level CSI/UWB/path_params preprocessing
+     train_baseline: multi-task supervised, use_aux flag, log/verbose API
+     train_dann_phase: GRL + DomainDiscriminator binary (sim vs sim-real)
+     evaluate: det F1/precision/recall, rec masked acc, id bit acc + full codeword
+     run_ablation: 5 varyant (full / no_path_aux / no_dann / no_kd / minimal)
+                   JSON dump + özet tablo
+     CLI: python -m training.train --phase {baseline,dann,distill}
+     CLI: python -m training.ablation --epochs N --batch_size M --device cpu/cuda
+
+     MEVCUT 5K VERİYLE MİNİ TEST (CPU, 2 epoch × 5 varyant):
+       VARYANT          F1     REC_ACC   ID_BIT   TIME
+       full           0.700    0.249     0.502    197.6 s
+       no_path_aux    0.763    0.248     0.501    172.1 s
+       no_dann        0.703    0.248     0.538    130.3 s
+       no_kd          0.746    0.248     0.507    121.8 s
+       minimal        0.751    0.248     0.504    126.1 s
+       TOPLAM: 779 s (~13 dk)
+     YORUM: 2 epoch + 5k sample = baseline'lar henüz öğrenmedi (rec_acc ~0.25 = 4-sınıf
+            random; id_bit ~0.50 = bit random). Pipeline çalıştığı doğrulandı; production
+            için 5×100k veri × 30-50 epoch + GPU gerekli. JSON: training/ablation_results.json
+
+EKSİK (stub veya hiç yok):
+  (Hiçbiri — tüm modüller çalışıyor. PROD fazı için fine-tune + Colab GPU eğitim kaldı.)
+
+
+================================================================================
+B YOLU — MİNİ VERİ → MODÜL MODÜL
+================================================================================
+
+FAZ 0 — MİNİ VERİ ÜRETİMİ (kullanıcı tarafı, Colab, ~30 dk)
+  Adım 0.1: Drive'a son revize kod yükle (14 dosya)
+  Adım 0.2: Eski aether_core/data/ klasörünü sil
+  Adım 0.3: Colab Runtime > Restart session
+  Adım 0.4: Hücre 1, 2, 3 çalıştır (drive mount + GPU + Sionna)
+  Adım 0.5: Hücre 4, 5 (import + sahne yükle)
+  Adım 0.6: Hücre 6 (sanity) — paired sample shape doğrulama
+  Adım 0.7: Hücre 7 (görsel sanity) — opsiyonel
+  Adım 0.8: Hücre 13 (PRESETS listesi, PER_PRESET=1000 zaten default)
+  Adım 0.9: Hücre 14 (classroom 1k UWB + WiFi + paired)
+  Adım 0.10: Hücre 15-18 sırayla (warehouse, office, lab, low_ceiling)
+  Adım 0.11: Hücre 19 (summary) — 5 preset × 1k = 5k toplam
+  Adım 0.12: Drive'dan lokale çek (~50 MB toplam mini veri)
+  ÇIKTI: PROJESON/data/<preset>/ × 5 klasör, her birinde 12 dosya
+  SÜRE: ~30 dk
+  NOT: ANCHOR + ESP32 POZİSYONU SABİT (variant rotation yok)
+
+FAZ 0.5 — SENSOR PLACEMENT RANDOMIZATION ✓ TAMAMLANDI 2026-05-19
+  Bkz: 07_SENSOR_PLACEMENT_RANDOMIZATION.txt
+  TETİKLEYİCİ: Kullanıcı 2026-05-15 "model anchor pozisyonunu ezberlemesin"
+  ÇIKTI: data_synthesis/layout_variants.py + main loop entegrasyon +
+         MultiDomainDataset layout-aware + COLAB_RUN H13-H18 parametre güncellemesi
+  TEST: 3 ayrı birim test geçti (modül, backward compat, layout-aware dataset)
+  PRODUCTION HEDEF: 5 preset × 5 variant × 20k = 500k toplam (Colab GPU)
+
+FAZ 1 — MODÜL 2: PREPROCESSING (sıra: en sonda agc_normalize devre dışı)
+  Bkz: 01_MODUL_2_PREPROCESSING.txt
+  ÇIKTI: preprocessing/ paketinin 6 dosyası tam çalışır
+  SÜRE: ~1 mesaj (~600 satır)
+
+FAZ 2 — MODÜL 3: ENCODERS
+  Bkz: 02_MODUL_3_ENCODERS.txt
+  ÇIKTI: csi_encoder + uwb_encoder + cross_attention + path_aux_head
+  SÜRE: ~2 mesaj (~800 satır)
+
+FAZ 3 — MODÜL 4: BRAIN (HEADS + FUSED MODEL)
+  Bkz: 03_MODUL_4_BRAIN.txt
+  ÇIKTI: 5 head + fused_model.py + SlidingTracker
+  SÜRE: ~2 mesaj (~700 satır)
+
+FAZ 4 — MODÜL 5: ADAPTATION
+  Bkz: 04_MODUL_5_ADAPTATION.txt
+  ÇIKTI: dann + residual_adapter + distillation
+  SÜRE: ~1 mesaj (~400 satır)
+
+FAZ 5 — BACKEND + DASHBOARD
+  Bkz: 05_BACKEND_DASHBOARD.txt
+  ÇIKTI: FastAPI app + WebSocket + Three.js voxel render
+  SÜRE: ~1-2 mesaj (~500 satır)
+
+FAZ 6 — EĞİTİM + ABLATION ✓ TAMAMLANDI 2026-05-19
+  Bkz: 06_TRAINING_ABLATION.txt
+  ÇIKTI: training/ paketi + 5 ablation varyantı + JSON sonuç
+  MEVCUT 5K MİNİ TESTİ: 779 s CPU, det_f1 0.70–0.76, rec/id baseline
+  PRODUCTION'A KALDI: 5×100k veri + 30-50 epoch GPU + gerçek metrik
+
+FAZ 7 — ÜRETİME GEÇİŞ
+  - Mini veri yetmiyorsa 10k veya 100k'a ölçek
+  - Real ESP32 + UWB fine-tune (1-2 gün)
+  - Jüri sunumu
+
+
+================================================================================
+BAĞIMLILIK ZİNCİRİ (hangisi hangisine bağlı)
+================================================================================
+
+generate_*_sionna.py
+        |
+        v
+  data/<preset>/*.npy            <-- FAZ 0 BİTMELİ
+        |
+        v
+preprocessing/* (FAZ 1)
+        |
+        v
+models/encoders/* (FAZ 2)        <-- preprocessing çıktısı tüketir
+        |
+        v
+models/heads/* + fused_model.py (FAZ 3)
+        |
+        v
+adaptation/* (FAZ 4)             <-- model'in encoder'larına grl/adapter sokar
+        |
+        v
+backend/* + dashboard/* (FAZ 5)  <-- fused_model yükler, sync_buffer kullanır
+        |
+        v
+train + ablation (FAZ 6)         <-- her şeyi koşturur
+
+
+================================================================================
+ÖNEMLİ KURALLAR
+================================================================================
+
+1. Her FAZ tamamlandığında bu dosya GÜNCELLENİR (status TAMAM/EKSİK).
+2. Modül kodu yazılırken o modülün TXT rehberine bakılır, oradan iskelet
+   alınır. TXT'lerde PSEUDOCODE + INTERFACE var, COPY-PASTE değil.
+3. Her modül için BİRİM TEST zorunlu (mini veri üzerinde forward pass).
+4. PyTorch tensör shape'leri her zaman docstring'te belirtilir.
+5. Multi-domain dataset için DataLoader collate_fn `domain_id` ekler
+   (DANN için).
+6. Path-aware auxiliary loss eğitimde aktif, inference'ta atılır.
+
+
+================================================================================
+ŞU AN BEKLEYEN KARARLAR
+================================================================================
+
+- Mini veri PER_PRESET sayısı: 1000 (default). Kullanıcı 500/2000 isteyebilir.
+- Cold start: Modül 2 implementasyonu sırasında PyTorch DataLoader yazılacak,
+  multi-domain concat mantığı netleşmeli.
+- Sliding window tracker: SlidingTracker model class'ı (TODO blok hazır)
+  Modül 4'te PyTorch ile implement edilecek.
+- DANN λ_max: 0.7 cap kararı (training.yaml'da), eğitim sırasında ablation.
+
+
+================================================================================
+TXT REHBER LİSTESİ
+================================================================================
+
+00_YOL_HARITASI.txt          (bu dosya)
+01_MODUL_2_PREPROCESSING.txt
+02_MODUL_3_ENCODERS.txt
+03_MODUL_4_BRAIN.txt
+04_MODUL_5_ADAPTATION.txt
+05_BACKEND_DASHBOARD.txt
+06_TRAINING_ABLATION.txt
+07_SENSOR_PLACEMENT_RANDOMIZATION.txt   (FAZ 0.5 — 1k testten sonra)
+99_RISKLER.txt               (bilinen risk envanteri)

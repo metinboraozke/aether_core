@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Aether Core PRESET: room_low_ceiling (10 × 5 × 2.2 m, düşük tavan) -->
+<scene version="3.0.0">
+
+  <integrator type="path"/>
+
+  <sensor type="perspective">
+    <float name="fov" value="60"/>
+    <transform name="to_world">
+      <lookat origin="5, -5, 1.5" target="5, 2.5, 1" up="0, 0, 1"/>
+    </transform>
+    <film type="hdrfilm">
+      <integer name="width"  value="640"/>
+      <integer name="height" value="480"/>
+    </film>
+  </sensor>
+
+  <bsdf type="diffuse" id="mat-itu_concrete">
+    <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
+  </bsdf>
+  <bsdf type="diffuse" id="mat-itu_metal">
+    <rgb name="reflectance" value="0.85, 0.85, 0.85"/>
+  </bsdf>
+  <bsdf type="diffuse" id="mat-itu_wood">
+    <rgb name="reflectance" value="0.5, 0.3, 0.2"/>
+  </bsdf>
+
+  <!-- ODA: 10 × 5 × 2.2 m -->
+  <shape type="rectangle" id="floor">
+    <transform name="to_world">
+      <scale x="5" y="2.5"/>
+      <translate x="5" y="2.5" z="0"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <shape type="rectangle" id="ceiling">
+    <transform name="to_world">
+      <scale x="5" y="2.5"/>
+      <rotate x="1" angle="180"/>
+      <translate x="5" y="2.5" z="2.2"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <shape type="rectangle" id="wall_front">
+    <transform name="to_world">
+      <scale x="5" y="1.1"/>
+      <rotate x="1" angle="-90"/>
+      <translate x="5" y="0" z="1.1"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <shape type="rectangle" id="wall_back">
+    <transform name="to_world">
+      <scale x="5" y="1.1"/>
+      <rotate x="1" angle="90"/>
+      <translate x="5" y="5" z="1.1"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <shape type="rectangle" id="wall_left">
+    <transform name="to_world">
+      <scale x="1.1" y="2.5"/>
+      <rotate y="1" angle="90"/>
+      <translate x="0" y="2.5" z="1.1"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <shape type="rectangle" id="wall_right">
+    <transform name="to_world">
+      <scale x="1.1" y="2.5"/>
+      <rotate y="1" angle="-90"/>
+      <translate x="10" y="2.5" z="1.1"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- RAF: merkez (5, 2.5, 1.0) — düşük tavana göre alçaltılmış -->
+  <shape type="cube" id="shelf_frame">
+    <transform name="to_world">
+      <scale x="0.5" y="0.2" z="0.5"/>
+      <translate x="5" y="2.5" z="1.0"/>
+    </transform>
+    <ref id="mat-itu_metal"/>
+  </shape>
+
+  <!-- 6 SLOT NESNESİ -->
+  <shape type="cube" id="slot_obj_1">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="1.33"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+  <shape type="cube" id="slot_obj_2">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="1.33"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+  <shape type="cube" id="slot_obj_3">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="1.00"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+  <shape type="cube" id="slot_obj_4">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="1.00"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+  <shape type="cube" id="slot_obj_5">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="0.67"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+  <shape type="cube" id="slot_obj_6">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="0.67"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+</scene>

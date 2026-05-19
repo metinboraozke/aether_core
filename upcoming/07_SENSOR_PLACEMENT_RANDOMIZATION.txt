@@ -1,0 +1,291 @@
+================================================================================
+SENSOR PLACEMENT RANDOMIZATION (FAZ 0.5)
+================================================================================
+Tarih: 2026-05-15 (plan) → 2026-05-19 (TAMAMLANDI)
+Status: ✅ TAMAMLANDI 2026-05-19
+Tetikleyici: kullanıcı (2026-05-15) "model anchor/ESP32 pozisyonunu ezberlemesin"
+
+YAPILANLAR:
+  + data_synthesis/layout_variants.py                  (YENİ)
+    - generate_layout_variants(base_nodes, n_variants, jitter_xy_m, jitter_z_m,
+      room_dims_m, clip_margin_m, seed) → list[list[dict]]
+    - jitter_node_position helper + oda sınır clip
+    - assign_layout_ids(n, n_variants) → uint8 contiguous block dağılım
+    - v=0 = base identity (backward compat); v>=1 deterministic per-variant seed
+
+  + data_synthesis/generate_hybrid_sionna.py           (UPDATE)
+    - --n_variants / --layout_jitter_xy / --layout_jitter_z / --layout_clip_margin
+      CLI argümanları (default n_variants=1 = eski davranış)
+    - main() loop'unda variant rotation: sample idx → layout_id → cfg_variant
+    - layout_ids.npy + layout_meta.yaml diske kaydı (variant başına 8 node referansı)
+
+  + data_synthesis/generate_wifi_csi_sionna.py         (UPDATE)
+    - Aynı CLI argümanları (UWB ile AYNI değerler → paired variant rotation)
+    - layout_ids_wifi.npy diske kaydı (UWB tarafıyla paired check için)
+
+  + data_synthesis/multi_domain_dataset.py             (UPDATE)
+    - _load_preset: layout_ids.npy opsiyonel oku (yoksa hepsi 0)
+    - load_link_geo_variants: layout_meta.yaml varsa her variant için link_geo
+      hesapla, yoksa scene.yaml fallback (backward compat)
+    - __getitem__: sample.layout_id → variants[lid] → doğru link_geo
+    - collate_with_preprocess: batch'e layout_id tensor eklendi
+
+  + configs/training.yaml                              (UPDATE)
+    - layout_randomization bloğu (n_variants_per_preset, jitter_xy/z, clip)
+
+  + COLAB_RUN.txt                                      (UPDATE)
+    - HÜCRE 13: N_VARIANTS / LAYOUT_JITTER_XY / LAYOUT_JITTER_Z globalleri
+    - HÜCRE 14-18: tüm UWB + WiFi script çağrılarına yeni argümanlar
+    - paired check'lere layout_ids == layout_ids_wifi karşılaştırması eklendi
+    - Çıktı yapısı dokümantasyonuna layout_ids/meta dosyaları eklendi
+
+BİRİM TESTLER (geçti):
+  1. layout_variants modülü:
+     - n_variants=1 → identity ✓
+     - n_variants=5 → jitter aktif + oda sınırı clip ✓
+     - aynı seed iki kez → birebir aynı variantlar ✓
+     - id/type/sensors korundu ✓
+     - assign_layout_ids contiguous + non-divisible son variant fazlasını alır ✓
+
+  2. Backward compat (mevcut 5k veri, layout_ids.npy yok):
+     - MultiDomainDataset 5000 sample yükledi ✓
+     - tüm sample'larda layout_id=0 (default) ✓
+     - link_geo scene.yaml fallback ile geldi ✓
+     - DataLoader batch_size=16 normal çalıştı ✓
+
+  3. Layout-aware dataset (mock 1k × 5 variant, classroom_default):
+     - s0   (variant 0): link_geo[0] = [5.00, 2.50, 2.95] (base)
+     - s500 (variant 2): link_geo[0] = [5.23, 2.42, 2.70] (~35 cm fark)
+     - s999 (variant 4): link_geo[0] = [5.38, 2.27, 2.70] (~38 cm fark)
+     - intra-variant (s0 vs s100): fark = 0 (aynı variant cached) ✓
+
+
+----- AŞAĞIDAKİ ORİJİNAL TASARIM NOTLARI REFERANS İÇİN KORUNUYOR -----
+
+HEDEF
+  Anchor + ESP32 pozisyonlarını sample-by-sample (variant rotation ile)
+  değiştir → model "spesifik konum" değil, "RF geometri prensipleri"ne
+  bakmaya zorlanır. Deployment-invariant generalization.
+
+NEDEN ŞART
+  Mevcut: 5 preset × 100k = 500k, her preset içinde anchor SABİT
+  Risk:   Model "M1 (4.6, 2.5, 2.95)" gibi spesifik koordinatları ezberler
+          → gerçek dünyada anchor 10-30 cm kayınca SİSTEM ÇÖKÜYOR
+  Çözüm:  Her preset için N variant (jitter ile farklı yerleşim), sample
+          o variant'larda dağıtılır → model konum-bağımsız öğrenir.
+
+
+================================================================================
+TASARIM
+================================================================================
+
+PARAMETRELER:
+  n_variants: 5  (preset başına farklı yerleşim sayısı)
+  jitter_xy_m: 0.3  (±30 cm XY plane gaussian jitter)
+  jitter_z_m: 0.1   (±10 cm Z gaussian jitter)
+  room_clip_margin: 0.3  (oda kenarından 30 cm pay)
+
+  Slot konumu DEĞİŞMEZ — sadece anchor + ESP32 pozisyonları jitter.
+  (Slot içinde nesnenin mm-mertebesi jitter zaten config'te var.)
+
+DAĞILIM (5 preset × 5 variant × 10k = 250k):
+  preset i, variant j: samples_per_variant adet örnek
+  Her variant kendi master_seed offset + variant offset ile deterministic.
+
+
+================================================================================
+DOSYALAR
+================================================================================
+
+YENİ:
+  data_synthesis/layout_variants.py
+    """Sensor placement randomization."""
+
+    import numpy as np
+
+    def generate_layout_variants(
+        base_nodes: list[dict],
+        n_variants: int = 5,
+        jitter_xy_m: float = 0.3,
+        jitter_z_m: float = 0.1,
+        room_dims_m: tuple[float, float, float] = (10.0, 5.0, 3.0),
+        clip_margin_m: float = 0.3,
+        seed: int = 42,
+    ) -> list[list[dict]]:
+        """Base node layout'tan N varyant üret.
+
+        Args:
+            base_nodes: scene.yaml'daki nodes listesi (8 düğüm)
+            n_variants: kaç farklı yerleşim üretilecek
+            jitter_xy_m / jitter_z_m: gaussian std
+            room_dims_m: oda sınırları (clip için)
+            clip_margin_m: oda kenarından minimum mesafe
+            seed: deterministic
+
+        Returns:
+            variants: shape (n_variants,) her biri yeni nodes listesi
+                      Her node: {**base_node, 'position_m': [new_x, new_y, new_z]}
+        """
+        rng = np.random.default_rng(seed)
+        variants = []
+        for v in range(n_variants):
+            new_nodes = []
+            for node in base_nodes:
+                pos = np.array(node['position_m'], dtype=np.float64)
+                jit = np.array([
+                    rng.normal(0, jitter_xy_m),
+                    rng.normal(0, jitter_xy_m),
+                    rng.normal(0, jitter_z_m),
+                ])
+                new_pos = pos + jit
+                # Oda sınırı clip
+                for k in range(3):
+                    lo = clip_margin_m
+                    hi = room_dims_m[k] - clip_margin_m
+                    new_pos[k] = max(lo, min(hi, new_pos[k]))
+                new_nodes.append({**node, 'position_m': new_pos.tolist()})
+            variants.append(new_nodes)
+        return variants
+
+
+GÜNCELLENECEK:
+  data_synthesis/generate_hybrid_sionna.py  — main() loop'una variant rotation
+  data_synthesis/generate_wifi_csi_sionna.py — aynı
+  COLAB_RUN.txt H14-H18 — --n_variants, --layout_jitter_xy/z parametreleri
+  configs/training.yaml — runtime altına layout_jitter blok
+
+
+================================================================================
+ENTEGRASYON (generate_hybrid_sionna.py main())
+================================================================================
+
+def main():
+    ...
+    cfg = load_scene_config(args.config)
+    base_nodes = cfg['nodes']
+
+    # Layout variants
+    variants = generate_layout_variants(
+        base_nodes,
+        n_variants=args.n_variants,
+        jitter_xy_m=args.layout_jitter_xy,
+        jitter_z_m=args.layout_jitter_z,
+        room_dims_m=(cfg['room']['width_m'],
+                     cfg['room']['depth_m'],
+                     cfg['room']['height_m']),
+        seed=cfg['domain']['master_seed'],
+    )
+    samples_per_variant = args.n // args.n_variants
+
+    print(f'[init] {args.n_variants} layout variant × {samples_per_variant} sample/variant')
+
+    master_rng = np.random.default_rng(args.seed)
+    sample_seeds = master_rng.integers(0, 2**31-1, size=args.n)
+    layout_ids = []
+
+    buffers = {...}  # +"layout_id"
+
+    sample_idx = 0
+    for v_idx, variant_nodes in enumerate(variants):
+        cfg_variant = {**cfg, 'nodes': variant_nodes}
+        # Sionna sahnesi aynı; sadece config'ten okunan nodes farklı
+        # build_one_paired_sample içindeki get_master_nodes/get_esp32_nodes
+        # cfg_variant'tan okur, yeni pozisyonlarla çalışır
+        for i in range(samples_per_variant):
+            sample_rng = np.random.default_rng(int(sample_seeds[sample_idx]))
+            sample = build_one_paired_sample(
+                scene=scene, cfg=cfg_variant, ...,
+                rng=sample_rng, ...,
+            )
+            for key in buffers: buffers[key].append(sample[key])
+            layout_ids.append(v_idx)
+            sample_idx += 1
+
+            if (sample_idx) % args.checkpoint_every == 0:
+                _save_checkpoint(buffers, ...)
+                buffers = {k: [] for k in buffers}
+
+    # layout_ids.npy ek dosya
+    np.save(os.path.join(args.out, 'layout_ids.npy'),
+            np.array(layout_ids, dtype=np.uint8))
+
+    _merge_checkpoints(...)
+
+
+================================================================================
+COLAB_RUN.txt H14-H18 GÜNCELLEME
+================================================================================
+
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --n_variants 5 \                  # ← YENİ
+    --layout_jitter_xy 0.3 \          # ← YENİ
+    --layout_jitter_z 0.1 \           # ← YENİ
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --seed {P['seed']}
+
+WiFi script için de aynı parametreler.
+
+
+================================================================================
+CONFIGS/TRAINING.YAML EKLEME
+================================================================================
+
+runtime:
+  ...
+  layout_randomization:
+    enabled: true
+    n_variants_per_preset: 5
+    jitter_xy_m: 0.3
+    jitter_z_m: 0.1
+    room_clip_margin_m: 0.3
+
+
+================================================================================
+PAIRED RNG GARANTİSİ (önemli)
+================================================================================
+
+UWB ve WiFi script'leri AYNI sample_seeds dizisini master_seed'den üretir.
+Variant rotation deterministic (aynı seed → aynı 5 variant).
+Her sample_idx'in hangi variant'a düştüğü deterministic (idx // samples_per_variant).
+→ UWB sample i ve WiFi sample i AYNI variant'ı AYNI slot konfigürasyonu ile üretir.
+
+  paired_check: slot_labels[i] == slot_labels_wifi[i]  ✓ KORUNUR
+  layout_check: variants UWB ve WiFi'da identical (deterministic seed)  ✓
+
+
+================================================================================
+ÇIKTI DOSYA EKLEME
+================================================================================
+
+Mevcut çıktılar + YENİ:
+  layout_ids.npy           [N]   uint8   0..n_variants-1
+
+
+================================================================================
+TEST PLANI
+================================================================================
+
+1) Tek preset (classroom) × 5 variant × 200 = 1k test
+2) layout_ids.npy çıktısı: her variant ~200 sample
+3) Sample 0 (variant 0) vs Sample 200 (variant 1) → link_geo farklı olmalı
+4) paired check: slot_labels == slot_labels_wifi
+5) Forward pass mock: model.encoder(...) çalışıyor mu (link_geo değişken)
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+
+  layout_variants.py:              ~80 satır
+  generate_*_sionna.py değişiklik: ~30 satır × 2 = 60 satır
+  COLAB_RUN.txt güncelleme:        ~20 satır × 5 (H14-H18) = 100 satır
+  configs/training.yaml:           ~7 satır
+
+  TOPLAM: ~250 satır + 1 mesaj
+  Süre: ~30 dk
+
+ZAMANLAMA: FAZ 0 (1k baseline test) GEÇTİKTEN SONRA.

@@ -1,0 +1,908 @@
+################################################################################
+# AETHER CORE — COLAB ÇALIŞTIRMA HÜCRELERİ (KOPYALA-YAPIŞTIR)
+################################################################################
+# Bu dosya, Modül 1 (Sionna 2.0 ile Teacher-Student CIR üretimi) için Colab
+# notebook hücrelerinin TAM ÇALIŞTIRILABİLİR halini içerir.
+#
+# KULLANIM:
+#   1. Aşağıdaki her HÜCRE bloğunu (# ====== HÜCRE N başlığından sonraki
+#      her şeyi, bir sonraki HÜCRE başlığına kadar) seç ve Colab'da yeni
+#      bir hücreye yapıştır.
+#   2. Tüm açıklamalar # ile başladığı için Python interpreter onları
+#      yorum sayar — bütün bloğu (açıklama dahil) güvenle yapıştırabilirsin.
+#   3. Hücreleri sırayla çalıştır (1 → 12).
+#
+# Açıklama/teori için: COLAB_REHBERI.txt
+# Mimari karar günlüğü için: README.md → "Tasarım Kararları"
+################################################################################
+
+
+################################################################################
+# ÖN HAZIRLIK (Colab'a girmeden ÖNCE — bu blok kod değil, sadece açıklama)
+################################################################################
+# 1. Lokal PROJESON klasörünü TÜM içeriğiyle Drive'a kopyala:
+#       Hedef: /MyDrive/PROJESON/
+#                ├── README.md
+#                ├── configs/
+#                ├── data_synthesis/
+#                ├── scenes/
+#                ├── models/
+#                └── ...
+#    Yöntem: drive.google.com → My Drive → "PROJESON" sürükle-bırak,
+#            VEYA Drive Desktop senkron klasörüne kopyala.
+#
+# 2. Colab'da yeni notebook aç:
+#       colab.research.google.com → New Notebook
+#
+# 3. Runtime > Change runtime type > Hardware accelerator > GPU
+#    (A100 ideal, T4 yedek). CPU runtime ile Sionna RT ÇALIŞMAZ.
+#
+# 4. Aşağıdaki HÜCRE 1'den başlayıp sırayla yapıştır + çalıştır.
+
+
+
+# ============================================================================
+# HÜCRE 1 — DRIVE MOUNT VE PROJE YOLU
+# ============================================================================
+# Amaç: Drive'ı bağla, PROJESON'u Python path'ine ekle, çıktı klasörünü hazırla.
+# Süre: ~10-30 saniye (auth dahil).
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, sys
+
+PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+OUTPUT_DIR   = '/content/drive/MyDrive/aether_core/data'
+
+sys.path.insert(0, PROJECT_ROOT)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.chdir(PROJECT_ROOT)
+
+print('Working dir :', os.getcwd())
+print('Output dir  :', OUTPUT_DIR)
+print('Klasör kontrol:')
+for d in ['configs', 'data_synthesis', 'scenes', 'models']:
+    print(f'  {d:20s}  {"OK" if os.path.isdir(d) else "EKSİK !!"}')
+print('Dosya kontrol:')
+for f in ['scenes/aether_classroom.xml',
+          'configs/scene.yaml',
+          'data_synthesis/generate_hybrid_sionna.py']:
+    print(f'  {f:50s}  {"OK" if os.path.isfile(f) else "EKSİK !!"}')
+
+# Eksik varsa: Drive'a PROJESON klasörünü yeniden kopyala.
+
+
+
+# ============================================================================
+# HÜCRE 2 — GPU KONTROL
+# ============================================================================
+# Amaç: GPU runtime aktif mi, hangi GPU?
+# Süre: < 5 saniye.
+
+!nvidia-smi
+
+# Beklenen: T4 / V100 / A100 satırı.
+# "command not found" / boş çıktı → CPU runtime'dasın.
+# Runtime > Change runtime type > GPU seç ve baştan çalıştır.
+
+
+
+# ============================================================================
+# HÜCRE 3 — SİONNA + BAĞIMLILIKLAR KUR
+# ============================================================================
+# Amaç: Sionna 2.0, Mitsuba 3, yardımcı kütüphaneler.
+# Süre: ~2-4 dakika (ilk kurulum). Sonraki sessionlarda cache'lenir.
+
+!pip install -q sionna mitsuba pyyaml tqdm
+
+import sionna
+import mitsuba as mi
+print('sionna  :', sionna.__version__)
+print('mitsuba :', mi.__version__)
+
+mi.set_variant('cuda_ad_rgb')
+print('mitsuba variant:', mi.variant())
+
+# sionna 2.x ve mitsuba 3.x görünmeli.
+# Variant set hata verirse: 'llvm_ad_rgb' veya 'scalar_rgb' dene
+# (CPU mode, daha yavaş ama çalışır).
+
+
+
+# ============================================================================
+# HÜCRE 4 — IMPORT VE KONFİGÜRASYON YÜKLE
+# ============================================================================
+# Amaç: Bizim modülleri import et, scene.yaml'ı oku.
+# Süre: < 5 saniye.
+
+import yaml
+import numpy as np
+
+from data_synthesis.generate_hybrid_sionna import (
+    build_sionna_scene,
+    build_one_paired_sample,
+    load_scene_config,
+    get_master_nodes,
+    get_esp32_nodes,
+)
+
+cfg = load_scene_config('configs/scene.yaml')
+
+# REVİZE 2026-05-15: HİBRİT TOPOLOJİ (4 master + 4 satellite)
+master_nodes = get_master_nodes(cfg)
+esp32_nodes  = get_esp32_nodes(cfg)
+sat_count    = len(esp32_nodes) - len(master_nodes)
+
+print('--- Konfigürasyon özeti ---')
+print(f'Domain        : {cfg["domain"]["name"]} (seed={cfg["domain"]["master_seed"]})')
+print(f'Oda           : {cfg["room"]["width_m"]}m x {cfg["room"]["depth_m"]}m x {cfg["room"]["height_m"]}m')
+print(f'Slot sayisi   : {cfg["shelf"]["n_slots"]}')
+print(f'Hibrit nodes  : {len(master_nodes)} master + {sat_count} satellite = {len(esp32_nodes)} ESP32')
+print(f'UWB bistatic  : C({len(master_nodes)},2) = {len(master_nodes)*(len(master_nodes)-1)//2} link')
+print(f'WiFi linkler  : C({len(esp32_nodes)},2) = {len(esp32_nodes)*(len(esp32_nodes)-1)//2} link')
+
+print('\\nSlot merkezleri:')
+for i, c in enumerate(cfg['slot_centers_m']):
+    print(f'  S{i+1}: {c}')
+
+print('\\nMaster nodes (UWB + WiFi):')
+for n in master_nodes:
+    print(f'  {n["id"]:6s} -> {n["position_m"]}')
+
+print('\\nSatellite nodes (sadece WiFi):')
+for n in esp32_nodes:
+    if n.get('type') == 'satellite':
+        print(f'  {n["id"]:6s} -> {n["position_m"]}')
+
+
+
+# ============================================================================
+# HÜCRE 5 — SAHNEYİ YÜKLE (SIONNA RT)
+# ============================================================================
+# Amaç: Mitsuba XML sahnesini Sionna'ya yükle, frekans + antenna ayarla.
+# Süre: ~5-15 saniye (ilk yüklemede daha uzun).
+
+scene = build_sionna_scene(
+    scene_xml_path='scenes/aether_classroom.xml',
+    cfg=cfg,
+    uwb_freq_hz=6.5e9,
+)
+
+print('Sahne yüklendi:', scene)
+print('Frekans      :', scene.frequency, 'Hz')
+
+# Görselleştirme (opsiyonel, bazı runtime'larda hata verebilir):
+# try:
+#     scene.preview()
+# except Exception as e:
+#     print('preview hatası (önemsiz):', e)
+
+# Hata gelirse stack trace'i bana yapıştır — Sionna 2.0 minor sürümü farklı
+# olabilir, build_sionna_scene içindeki API çağrılarını düzeltebiliriz.
+
+
+
+# ============================================================================
+# HÜCRE 6 — TEK PAIRED SAMPLE ÜRET (PIPELINE SAĞLIK TESTİ)
+# ============================================================================
+# Amaç: Tüm pipeline'ı (sahne -> 2 path-solve -> Hamming -> gürültü) tek
+#       örnek üzerinde çalıştır. Şekiller doğru mu?
+# Süre: ilk seferinde ~30-90 saniye (Sionna RT JIT kompilasyonu),
+#       sonrakiler ~3-10 saniye/örnek.
+
+rng = np.random.default_rng(seed=42)
+
+sample = build_one_paired_sample(
+    scene=scene,
+    cfg=cfg,
+    sample_rate_hz=500e6,
+    n_taps=32,
+    rng=rng,
+    max_depth=5,
+)
+
+print('--- Tek paired sample ---')
+for k, v in sample.items():
+    print(f'  {k:18s} shape={str(v.shape):20s} dtype={str(v.dtype):10s} '
+          f'min={v.min():.3f} max={v.max():.3f}')
+
+# Beklenen şekiller (REVİZE 2026-05-15: hibrit topoloji + 6 bistatic link):
+#   cir_oracle:           (6, 32, 2)  float32   <- Teacher (6 slot)
+#   cir_anchor:           (6, 32, 2)  float32   <- Student (6 BİSTATİK link, 4→6)
+#   path_params_oracle:   (6, 20, 4)  float32   <- DML-AP teacher hedefi
+#   path_params_anchor:   (6, 20, 4)  float32   <- raw path bilgisi (4→6)
+#   slot_labels:          (6,)        uint8
+#   material_labels:      (6,)        uint8
+#   codeword_labels:      (6, 7)      uint8     <- Hamming(7,4)
+#   data_id_labels:       (6,)        uint8     <- 0-15
+
+assert sample['cir_oracle'].shape == (6, 32, 2)
+assert sample['cir_anchor'].shape == (6, 32, 2), "REVİZE: bistatic 6 link"
+assert sample['path_params_oracle'].shape == (6, 20, 4)
+assert sample['path_params_anchor'].shape == (6, 20, 4), "REVİZE: bistatic 6 link"
+assert sample['codeword_labels'].shape == (6, 7)
+print('OK — sekiller dogru (hibrit topoloji + 6 bistatic + path_params).')
+
+# path_params validity mask kontrolu (kac path Sionna buldu?)
+n_oracle_paths = int(sample['path_params_oracle'][..., 3].sum())
+n_anchor_paths = int(sample['path_params_anchor'][..., 3].sum())
+print(f'  Oracle path sayisi: {n_oracle_paths} (max 6×20=120)')
+print(f'  Anchor path sayisi: {n_anchor_paths} (max 6×20=120, REVİZE)')
+
+
+
+# ============================================================================
+# HÜCRE 7 — GÖRSEL DOĞRULAMA (ORACLE TEMİZ, ANCHOR GÜRÜLTÜLÜ MÜ?)
+# ============================================================================
+# Amaç: Oracle'da Lorentzian çentikler net, Anchor'da gürültü görünür mü?
+# Süre: ~5 saniye.
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 7))
+
+o_ri = sample['cir_oracle'][0]
+o = o_ri[..., 0] + 1j * o_ri[..., 1]
+axes[0, 0].plot(np.abs(o), 'g-')
+axes[0, 0].set_title(f'ORACLE slot 0 |CIR| (gürültüsüz)\n'
+                     f'slot dolu? {bool(sample["slot_labels"][0])}')
+axes[0, 0].set_xlabel('tap'); axes[0, 0].set_ylabel('amplitude')
+
+axes[0, 1].plot(np.abs(np.fft.fftshift(np.fft.fft(o))), 'g-')
+axes[0, 1].set_title(f'ORACLE slot 0 |CFR|  '
+                     f'<-  codeword: {sample["codeword_labels"][0].tolist()}')
+axes[0, 1].set_xlabel('frequency bin')
+
+a_ri = sample['cir_anchor'][0]
+a = a_ri[..., 0] + 1j * a_ri[..., 1]
+axes[1, 0].plot(np.abs(a), 'r-')
+axes[1, 0].set_title('ANCHOR 0 |CIR| (path-loss + AGC + CFO + WiFi/BT + AWGN)')
+axes[1, 0].set_xlabel('tap')
+
+axes[1, 1].plot(np.abs(np.fft.fftshift(np.fft.fft(a))), 'r-')
+axes[1, 1].set_title('ANCHOR 0 |CFR| (gürültülü)')
+axes[1, 1].set_xlabel('frequency bin')
+
+plt.tight_layout()
+plt.show()
+
+# KRİTİK GÖZLEM:
+# - Oracle |CFR|'da codeword[i]=1 olan bantlarda BELİRGİN DİP olmalı.
+# - Anchor |CFR| daha bulanık ama çentikler hâlâ kısmen görünür olmalı.
+# - Hiç fark yoksa Lorentzian enjeksiyon çalışmıyor (resonator_inject.py).
+
+
+
+# ============================================================================
+# HÜCRE 8 — MİNİ ÜRETİM TESTİ (n=100, pipeline emin oluncaya kadar)
+# ============================================================================
+# Amaç: Asıl üretimden önce 100 örnekle script'i bir tur çalıştır.
+# Süre: ~2-5 dakika (A100), ~10-15 dakika (T4).
+
+TEST_OUT = '/content/drive/MyDrive/aether_core/data_test'
+os.makedirs(TEST_OUT, exist_ok=True)
+
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n 100 \
+    --out {TEST_OUT} \
+    --scene scenes/aether_classroom.xml \
+    --config configs/scene.yaml \
+    --checkpoint_every 50 \
+    --seed 1234
+
+print('\n--- Mini test çıktıları ---')
+for f in sorted(os.listdir(TEST_OUT)):
+    p = os.path.join(TEST_OUT, f)
+    sz_mb = os.path.getsize(p) / (1024 * 1024)
+    print(f'  {f:30s}  {sz_mb:.2f} MB')
+
+# Beklenen 6 dosya: uwb_cir_oracle, uwb_cir_anchor, slot_labels,
+#                    material_labels, codeword_labels, data_id_labels
+
+
+
+# ============================================================================
+# HÜCRE 9 — ANA ÜRETİM (n=10000, bitirme demosu için yeterli)
+# ============================================================================
+# Amaç: Asıl train veri setini üret.
+# Süre: A100 ~30-60 dk, V100 ~60-90 dk, T4 ~3-5 saat.
+# Colab session timeout (12 saat) öncesi BİTMELİ.
+# --checkpoint_every 500 sayesinde kesilse bile ara dosyalar Drive'da kalır.
+
+N_SAMPLES = 10000
+
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {N_SAMPLES} \
+    --out {OUTPUT_DIR} \
+    --scene scenes/aether_classroom.xml \
+    --config configs/scene.yaml \
+    --checkpoint_every 500 \
+    --seed 42
+
+# Hücre çalışırken Colab tab'ını AÇIK tut, session düşmesin.
+
+
+
+# ============================================================================
+# HÜCRE 9b — WIFI 2.4 GHz CSI ÜRETİMİ (UWB sonrası, paired dataset)
+# ============================================================================
+# Amaç: UWB script'inin kardeşi. Aynı sahne, aynı seed → aynı stochastic
+#       slot konfigürasyonları. Çıktı: csivec_delta.npy [N, 28, 108, 2].
+# Süre: L4'te ~30-60 dk (28 link × 2 pass = UWB'den ~3x yavaş).
+# ÖNEMLİ: --seed 42 ile çalıştır → UWB ile birebir paired dataset olur.
+
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {N_SAMPLES} \
+    --out {OUTPUT_DIR} \
+    --scene scenes/aether_classroom.xml \
+    --config configs/scene.yaml \
+    --checkpoint_every 1000 \
+    --seed 42
+
+# Bittiginde {OUTPUT_DIR} icinde su 3 yeni dosya olmali:
+#   csivec_delta.npy           (10000, 28, 108, 2) float32  ~50 MB
+#   slot_labels_wifi.npy       (10000, 6) uint8
+#   material_labels_wifi.npy   (10000, 6) uint8
+#
+# slot_labels_wifi.npy ile slot_labels.npy KARSILAŞTIR — birebir aynı olmali.
+# Eger farkliysa seed senkron degil; UWB'yi tekrar üret veya seed'i kontrol et.
+
+
+
+# ============================================================================
+# HÜCRE 9c — PAIRED DATASET DOĞRULAMA (UWB ↔ WiFi)
+# ============================================================================
+# Amaç: csivec_delta uretildikten sonra UWB ve WiFi etiketlerinin tutarli
+#       oldugunu dogrula. Sadece 5 saniye.
+
+import numpy as np
+
+uwb_slot  = np.load(os.path.join(OUTPUT_DIR, 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(OUTPUT_DIR, 'slot_labels_wifi.npy'))
+uwb_mat   = np.load(os.path.join(OUTPUT_DIR, 'material_labels.npy'))
+wifi_mat  = np.load(os.path.join(OUTPUT_DIR, 'material_labels_wifi.npy'))
+
+slot_match = np.array_equal(uwb_slot, wifi_slot)
+mat_match  = np.array_equal(uwb_mat, wifi_mat)
+print('Slot etiketleri eslesiyor mu     :', slot_match)
+print('Materyal etiketleri eslesiyor mu :', mat_match)
+
+if slot_match and mat_match:
+    print('OK paired dataset garantisi saglandi.')
+    csivec = np.load(os.path.join(OUTPUT_DIR, 'csivec_delta.npy'))
+    print(f'csivec_delta    shape: {csivec.shape} dtype: {csivec.dtype}')
+    print(f'  sample 0 link 0 ilk 5 subcarrier real: {csivec[0,0,:5,0]}')
+    # path_params_csi de uretildi mi?
+    pc_path = os.path.join(OUTPUT_DIR, 'path_params_csi.npy')
+    if os.path.exists(pc_path):
+        path_csi = np.load(pc_path)
+        print(f'path_params_csi shape: {path_csi.shape} dtype: {path_csi.dtype}')
+        n_paths = int(path_csi[..., 3].sum())
+        n_total = path_csi.shape[0] * path_csi.shape[1] * path_csi.shape[2]
+        print(f'  Aktif path sayisi: {n_paths} / {n_total} ({100*n_paths/n_total:.1f}% doluluk)')
+    else:
+        print('NOT: path_params_csi.npy yok — script eski versiyon olabilir, yeniden yukle.')
+else:
+    print('UYARI: paired eslesme bozuk! Seed kontrol et veya yeniden uret.')
+
+
+
+# ============================================================================
+# HÜCRE 10 — FİNAL DOĞRULAMA (ÜRETİLEN .NPY'LER SAĞLIKLI MI?)
+# ============================================================================
+# Amaç: Şekil + dağılım + bir sample görsel kontrolü.
+# Süre: ~10-30 saniye.
+
+import numpy as np
+
+files = {
+    'uwb_cir_oracle.npy':       (None, 6, 32, 2),
+    'uwb_cir_anchor.npy':       (None, 6, 32, 2),   # REVİZE 2026-05-15: 4→6 bistatic
+    'path_params_oracle.npy':   (None, 6, 20, 4),
+    'path_params_anchor.npy':   (None, 6, 20, 4),   # REVİZE 2026-05-15: 4→6
+    'slot_labels.npy':          (None, 6),
+    'material_labels.npy':      (None, 6),
+    'codeword_labels.npy':      (None, 6, 7),
+    'data_id_labels.npy':       (None, 6),
+}
+
+print('--- Final dosyalar ---')
+loaded = {}
+for fname, expected_shape in files.items():
+    p = os.path.join(OUTPUT_DIR, fname)
+    arr = np.load(p)
+    loaded[fname] = arr
+    sz_mb = os.path.getsize(p) / (1024 * 1024)
+    print(f'  {fname:24s} shape={str(arr.shape):20s} dtype={str(arr.dtype):10s} {sz_mb:.1f} MB')
+    for got, exp in zip(arr.shape, expected_shape):
+        if exp is not None:
+            assert got == exp, f'{fname}: beklenen {exp}, geldi {got}'
+
+sl = loaded['slot_labels.npy']
+print(f'\nSlot doluluk oranı (her slot): {sl.mean(axis=0)}')
+print(f'Toplam dolu slot oranı       : {sl.mean():.3f}')
+
+mat = loaded['material_labels.npy']
+mat_filled = mat[sl == 1]
+print('\nMateryal histogramı (dolu slotlar):')
+for m_id, name in enumerate(['boş', 'metal', 'plastik', 'ahşap', 'karton']):
+    count = int((mat_filled == m_id).sum())
+    print(f'  {m_id} {name:10s}: {count}')
+
+cw = loaded['codeword_labels.npy']
+assert set(np.unique(cw)).issubset({0, 1}), 'codeword binary olmalı'
+print('\nCodeword binary OK')
+
+ids = loaded['data_id_labels.npy']
+ids_filled = ids[sl == 1]
+unique_ids = np.unique(ids_filled)
+print(f'Unique data_id sayısı: {len(unique_ids)} (max 16 beklenir)')
+
+print('\n=== TUM KONTROLLER GECTI ===')
+print('Drive yolu:', OUTPUT_DIR)
+
+
+
+# ============================================================================
+# HÜCRE 11 — BİR SAMPLE'IN ORACLE vs ANCHOR GÖRSELİ (SON KONTROL)
+# ============================================================================
+# Amaç: Üretilen veride oracle ve anchor arasındaki "öğretmen-öğrenci"
+#       farkı gözle görülür mü?
+# Süre: ~5 saniye.
+
+import matplotlib.pyplot as plt
+
+idx = 0
+o = loaded['uwb_cir_oracle.npy'][idx]
+a = loaded['uwb_cir_anchor.npy'][idx]
+sl_idx = loaded['slot_labels.npy'][idx]
+cw_idx = loaded['codeword_labels.npy'][idx]
+mat_idx = loaded['material_labels.npy'][idx]
+
+fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+
+for k in range(4):
+    a_c = a[k, ..., 0] + 1j * a[k, ..., 1]
+    axes[0, k].plot(np.abs(np.fft.fftshift(np.fft.fft(a_c))), 'r-')
+    axes[0, k].set_title(f'ANCHOR {k} |CFR|')
+    axes[0, k].set_xlabel('freq bin')
+
+for k in range(4):
+    o_c = o[k, ..., 0] + 1j * o[k, ..., 1]
+    axes[1, k].plot(np.abs(np.fft.fftshift(np.fft.fft(o_c))), 'g-')
+    title = f'ORACLE slot {k+1} | dolu={bool(sl_idx[k])}'
+    if sl_idx[k]:
+        title += f' mat={mat_idx[k]} cw={cw_idx[k].tolist()}'
+    axes[1, k].set_title(title, fontsize=9)
+    axes[1, k].set_xlabel('freq bin')
+
+plt.tight_layout()
+plt.show()
+
+
+
+################################################################################
+# PHASE 2 — MULTI-DOMAIN ÜRETİM (5 SAHNE PRESET'İ)
+################################################################################
+# Mantık: 5 farklı sahne preset'inde aynı pipeline koşturulur. Her preset
+#         farklı master_seed kullanır (configs/scene_*.yaml > domain.master_seed)
+#         → preset'ler birbirinden bağımsız ama her biri kendi içinde paired
+#         (UWB + WiFi).
+#
+# 5 PRESET:
+#   1. classroom_default     (mevcut, 10×5×3 m)         seed=42
+#   2. warehouse_large       (15×10×5 m)                 seed=142
+#   3. office_small          (6×4×2.5 m, alçıpan)        seed=242
+#   4. lab_medium            (8×6×3 m, metal-yoğun)      seed=342
+#   5. room_low_ceiling      (10×5×2.2 m, düşük tavan)   seed=442
+#
+# ÇIKTI YAPISI (her preset için ayrı klasör):
+#   /MyDrive/aether_core/data/<preset_name>/
+#       ├── uwb_cir_oracle.npy
+#       ├── uwb_cir_anchor.npy
+#       ├── path_params_oracle.npy        (REVİZE 2026-05-15: DML-AP teacher)
+#       ├── path_params_anchor.npy        (REVİZE 2026-05-15)
+#       ├── slot_labels.npy
+#       ├── material_labels.npy
+#       ├── codeword_labels.npy
+#       ├── data_id_labels.npy
+#       ├── csivec_delta.npy
+#       ├── path_params_csi.npy           (REVİZE 2026-05-15: DML-AP teacher CSI)
+#       ├── slot_labels_wifi.npy
+#       ├── material_labels_wifi.npy
+#       ├── layout_ids.npy                (FAZ 0.5 2026-05-19: hangi sample hangi variant)
+#       ├── layout_ids_wifi.npy           (FAZ 0.5: UWB ile paired check için)
+#       └── layout_meta.yaml              (FAZ 0.5: variant başına 8 node konum referansı)
+#
+# SİLME UYARISI: Her preset için klasör yeniden üretilirse drive'da elle sil.
+# Drive'da 1 TB var, 5 preset × 100k ≈ 250 MB total — endişe yok.
+
+
+
+# ============================================================================
+# HÜCRE 13 — PRESET KONFİGÜRASYON LİSTESİ
+# ============================================================================
+# Tüm preset'lerin XML + config + seed eşlemesi. Sonraki hücreler bu listeyi
+# kullanır. Sample sayısını PER_PRESET değiştirerek ölçeklendir.
+
+PER_PRESET = 1000    # MİNİ VERİ (B stratejisi): 5×1k = 5k toplam, ~30 dk.
+                     # Modül 2-5 baseline'ı oturduktan sonra 10000/100000'e çık.
+                     # Production: 10k = 5 saat, 100k = ~45 saat (multi-session)
+
+# FAZ 0.5 — Sensor Placement Randomization
+# Aynı odada N farklı sensör yerleşimi → model konum ezberlemez,
+# gerçek dünyada 10-30 cm anchor kayması sistemi çökertmez.
+# N_VARIANTS=1 = klasik sabit layout (eski davranış)
+# N_VARIANTS=5 = preset başına 5 jittered layout, her birinde PER_PRESET/5 sample
+N_VARIANTS       = 5         # her preset için kaç farklı yerleşim
+LAYOUT_JITTER_XY = 0.3       # metre, XY plane gaussian std
+LAYOUT_JITTER_Z  = 0.1       # metre, Z gaussian std
+# Not: UWB ve WiFi script'lerine AYNI değerler verilir (paired variant rotation)
+
+PRESETS = [
+    {
+        "name":   "classroom_default",
+        "scene":  "scenes/aether_classroom.xml",
+        "config": "configs/scene.yaml",
+        "seed":   42,
+    },
+    {
+        "name":   "warehouse_large",
+        "scene":  "scenes/aether_warehouse_large.xml",
+        "config": "configs/scene_warehouse_large.yaml",
+        "seed":   142,
+    },
+    {
+        "name":   "office_small",
+        "scene":  "scenes/aether_office_small.xml",
+        "config": "configs/scene_office_small.yaml",
+        "seed":   242,
+    },
+    {
+        "name":   "lab_medium",
+        "scene":  "scenes/aether_lab_medium.xml",
+        "config": "configs/scene_lab_medium.yaml",
+        "seed":   342,
+    },
+    {
+        "name":   "room_low_ceiling",
+        "scene":  "scenes/aether_room_low_ceiling.xml",
+        "config": "configs/scene_room_low_ceiling.yaml",
+        "seed":   442,
+    },
+]
+
+DRIVE_BASE = '/content/drive/MyDrive/aether_core/data'
+
+import os
+for p in PRESETS:
+    p['out'] = os.path.join(DRIVE_BASE, p['name'])
+    os.makedirs(p['out'], exist_ok=True)
+    print(f'  {p["name"]:22s}  →  {p["out"]}')
+
+
+
+# ============================================================================
+# HÜCRE 14 — PRESET 1: classroom_default — UWB + WiFi
+# ============================================================================
+# Süre: UWB ~12 dk + WiFi ~45 dk (10k her biri). Toplam ~1 saat.
+
+P = PRESETS[0]   # classroom_default
+
+print(f'=== {P["name"]} — UWB üretim ===')
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+print(f'\n=== {P["name"]} — WiFi üretim ===')
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+# Paired doğrulama
+import numpy as np
+uwb_slot  = np.load(os.path.join(P['out'], 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(P['out'], 'slot_labels_wifi.npy'))
+print(f'\n[{P["name"]}] paired eslesme:', np.array_equal(uwb_slot, wifi_slot))
+# FAZ 0.5 — layout paired check
+uwb_layout  = np.load(os.path.join(P['out'], 'layout_ids.npy'))
+wifi_layout = np.load(os.path.join(P['out'], 'layout_ids_wifi.npy'))
+print(f'[{P["name"]}] layout paired:', np.array_equal(uwb_layout, wifi_layout),
+      f'(variant dağılımı: {np.bincount(uwb_layout).tolist()})')
+
+
+
+# ============================================================================
+# HÜCRE 15 — PRESET 2: warehouse_large — UWB + WiFi
+# ============================================================================
+# Süre: ~1 saat (10k için). Büyük oda → multi-bounce daha pahalı olabilir.
+
+P = PRESETS[1]   # warehouse_large
+
+print(f'=== {P["name"]} — UWB üretim ===')
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+print(f'\n=== {P["name"]} — WiFi üretim ===')
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+import numpy as np
+uwb_slot  = np.load(os.path.join(P['out'], 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(P['out'], 'slot_labels_wifi.npy'))
+print(f'\n[{P["name"]}] paired eslesme:', np.array_equal(uwb_slot, wifi_slot))
+# FAZ 0.5 — layout paired check
+uwb_layout  = np.load(os.path.join(P['out'], 'layout_ids.npy'))
+wifi_layout = np.load(os.path.join(P['out'], 'layout_ids_wifi.npy'))
+print(f'[{P["name"]}] layout paired:', np.array_equal(uwb_layout, wifi_layout),
+      f'(variant dağılımı: {np.bincount(uwb_layout).tolist()})')
+
+
+
+# ============================================================================
+# HÜCRE 16 — PRESET 3: office_small — UWB + WiFi
+# ============================================================================
+# Süre: ~45 dk (küçük oda → daha az path).
+
+P = PRESETS[2]   # office_small
+
+print(f'=== {P["name"]} — UWB üretim ===')
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+print(f'\n=== {P["name"]} — WiFi üretim ===')
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+import numpy as np
+uwb_slot  = np.load(os.path.join(P['out'], 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(P['out'], 'slot_labels_wifi.npy'))
+print(f'\n[{P["name"]}] paired eslesme:', np.array_equal(uwb_slot, wifi_slot))
+# FAZ 0.5 — layout paired check
+uwb_layout  = np.load(os.path.join(P['out'], 'layout_ids.npy'))
+wifi_layout = np.load(os.path.join(P['out'], 'layout_ids_wifi.npy'))
+print(f'[{P["name"]}] layout paired:', np.array_equal(uwb_layout, wifi_layout),
+      f'(variant dağılımı: {np.bincount(uwb_layout).tolist()})')
+
+
+
+# ============================================================================
+# HÜCRE 17 — PRESET 4: lab_medium — UWB + WiFi
+# ============================================================================
+# Süre: ~50 dk.
+
+P = PRESETS[3]   # lab_medium
+
+print(f'=== {P["name"]} — UWB üretim ===')
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+print(f'\n=== {P["name"]} — WiFi üretim ===')
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+import numpy as np
+uwb_slot  = np.load(os.path.join(P['out'], 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(P['out'], 'slot_labels_wifi.npy'))
+print(f'\n[{P["name"]}] paired eslesme:', np.array_equal(uwb_slot, wifi_slot))
+# FAZ 0.5 — layout paired check
+uwb_layout  = np.load(os.path.join(P['out'], 'layout_ids.npy'))
+wifi_layout = np.load(os.path.join(P['out'], 'layout_ids_wifi.npy'))
+print(f'[{P["name"]}] layout paired:', np.array_equal(uwb_layout, wifi_layout),
+      f'(variant dağılımı: {np.bincount(uwb_layout).tolist()})')
+
+
+
+# ============================================================================
+# HÜCRE 18 — PRESET 5: room_low_ceiling — UWB + WiFi
+# ============================================================================
+# Süre: ~50 dk.
+
+P = PRESETS[4]   # room_low_ceiling
+
+print(f'=== {P["name"]} — UWB üretim ===')
+!python -m data_synthesis.generate_hybrid_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+print(f'\n=== {P["name"]} — WiFi üretim ===')
+!python -m data_synthesis.generate_wifi_csi_sionna \
+    --n {PER_PRESET} \
+    --out {P['out']} \
+    --scene {P['scene']} \
+    --config {P['config']} \
+    --checkpoint_every 1000 \
+    --n_variants {N_VARIANTS} \
+    --layout_jitter_xy {LAYOUT_JITTER_XY} \
+    --layout_jitter_z {LAYOUT_JITTER_Z} \
+    --seed {P['seed']}
+
+import numpy as np
+uwb_slot  = np.load(os.path.join(P['out'], 'slot_labels.npy'))
+wifi_slot = np.load(os.path.join(P['out'], 'slot_labels_wifi.npy'))
+print(f'\n[{P["name"]}] paired eslesme:', np.array_equal(uwb_slot, wifi_slot))
+# FAZ 0.5 — layout paired check
+uwb_layout  = np.load(os.path.join(P['out'], 'layout_ids.npy'))
+wifi_layout = np.load(os.path.join(P['out'], 'layout_ids_wifi.npy'))
+print(f'[{P["name"]}] layout paired:', np.array_equal(uwb_layout, wifi_layout),
+      f'(variant dağılımı: {np.bincount(uwb_layout).tolist()})')
+
+
+
+# ============================================================================
+# HÜCRE 19 — TÜM PRESET'LERİN BİRLEŞİK SUMMARY
+# ============================================================================
+# Tüm preset klasörlerini tarayıp shape/dağılım kontrol eder. Multi-domain
+# concat işlemi Modül 2 (preprocessing) sırasında PyTorch DataLoader içinde
+# yapılır — burada sadece doğrulama.
+
+import numpy as np, os
+
+print(f'{"PRESET":22s} {"N":>6s} {"OracleMB":>10s} {"AnchorMB":>10s} {"CSI MB":>10s}  Paired')
+print('-' * 80)
+
+total_n = 0
+for P in PRESETS:
+    out = P['out']
+    if not os.path.isdir(out):
+        print(f'{P["name"]:22s}  KLASÖR YOK')
+        continue
+    try:
+        oracle  = np.load(os.path.join(out, 'uwb_cir_oracle.npy'),     mmap_mode='r')
+        anchor  = np.load(os.path.join(out, 'uwb_cir_anchor.npy'),     mmap_mode='r')
+        csi     = np.load(os.path.join(out, 'csivec_delta.npy'),       mmap_mode='r')
+        path_o  = np.load(os.path.join(out, 'path_params_oracle.npy'), mmap_mode='r')
+        path_a  = np.load(os.path.join(out, 'path_params_anchor.npy'), mmap_mode='r')
+        path_c  = np.load(os.path.join(out, 'path_params_csi.npy'),    mmap_mode='r')
+        slot_u  = np.load(os.path.join(out, 'slot_labels.npy'))
+        slot_w  = np.load(os.path.join(out, 'slot_labels_wifi.npy'))
+        n       = oracle.shape[0]
+        paired  = np.array_equal(slot_u, slot_w)
+        # Toplam disk kullanimi (MB) bu preset icin
+        all_files = ['uwb_cir_oracle.npy', 'uwb_cir_anchor.npy', 'csivec_delta.npy',
+                     'path_params_oracle.npy', 'path_params_anchor.npy', 'path_params_csi.npy',
+                     'slot_labels.npy', 'material_labels.npy', 'codeword_labels.npy',
+                     'data_id_labels.npy', 'slot_labels_wifi.npy', 'material_labels_wifi.npy']
+        sz_total = sum(os.path.getsize(os.path.join(out, f)) for f in all_files
+                       if os.path.exists(os.path.join(out, f))) / (1024*1024)
+        print(f'{P["name"]:22s} {n:6d} {sz_total:9.1f}M  paired={paired}')
+        total_n += n
+    except Exception as e:
+        print(f'{P["name"]:22s}  HATA: {e}')
+
+print('-' * 80)
+print(f'TOPLAM: {total_n} sample × {len(PRESETS)} preset = multi-domain dataset hazır')
+print(f'        (her sample: oracle CIR + anchor CIR + diferansiyel CSI +')
+print(f'                     path_params x3 + 5 etiket dosyasi)')
+
+
+
+# ============================================================================
+# HÜCRE 12 — DOSYA İNDİRME REHBERİ (Colab dışı, lokal)
+# ============================================================================
+# Bu adım Colab'da DEĞİL, lokal makinende yapılır.
+#
+# Yöntem 1 — Drive Desktop yüklü:
+#   /MyDrive/aether_core/data/ klasörü otomatik senkronlanır.
+#   File Explorer'da bu klasörü aç, 6 .npy dosyasını PROJESON/data/'ya kopyala.
+#
+# Yöntem 2 — Drive Desktop yok:
+#   1. drive.google.com aç
+#   2. My Drive > aether_core > data klasörüne gir
+#   3. 6 .npy dosyasını seç (Ctrl+A veya tek tek)
+#   4. Sağ tık > Download
+#   5. İndiklerinde PROJESON/data/ klasörüne çıkar/kopyala
+#
+# Beklenen lokal yapı:
+#   c:\Users\metin\OneDrive\Masaustu\PROJESON\data\<preset_name>\
+#        ├── uwb_cir_oracle.npy            (~14 MB @ 10k örnek)
+#        ├── uwb_cir_anchor.npy            (~10 MB)
+#        ├── path_params_oracle.npy        (~19 MB)  UWB DML-AP teacher
+#        ├── path_params_anchor.npy        (~13 MB)
+#        ├── csivec_delta.npy              (~50 MB)
+#        ├── path_params_csi.npy           (~90 MB)  WiFi DML-AP teacher
+#        ├── slot_labels.npy               (~60 KB)
+#        ├── material_labels.npy           (~60 KB)
+#        ├── codeword_labels.npy           (~420 KB)
+#        ├── data_id_labels.npy            (~60 KB)
+#        ├── slot_labels_wifi.npy          (~60 KB)
+#        └── material_labels_wifi.npy      (~60 KB)
+#
+# Preset basina ~200 MB. 5 preset @ 100k -> ~10 GB total.
+#
+# Bittiğinde bana haber ver — Modül 2 (preprocessing) lokalde başlar.
+
+
+
+################################################################################
+# SORUN ÇIKARSA — yaygın hatalar ve çözümleri
+################################################################################
+# - HÜCRE 5 hata: Sionna API uyumsuzluğu.
+#   Düzeltme yeri: data_synthesis/generate_hybrid_sionna.py -> build_sionna_scene()
+#   Bana hata stack trace'ini ve sionna.__version__ değerini yapıştır.
+#
+# - HÜCRE 6 hata "PathSolver TypeError" / "paths.cir() unexpected kwarg":
+#   Sionna 2.0 minor sürümü farklı. compute_cir_for_current_rxs() içinde
+#   solver çağrısının kwarg'larını ve a/tau eksen squeeze mantığını
+#   düzeltmemiz gerekebilir.
+#
+# - HÜCRE 6 hata "ITURadioMaterial 'plasterboard' not found":
+#   Preset adı sürümle değişmiş. assign_slot_materials() içindeki iturm_map
+#   sözlüğünden o satırı çıkar veya alternatif preset (ör 'glass') kullan.
+#
+# - "OOM (out of memory)" -> checkpoint_every 500 -> 100, runtime restart.
+#   T4 sınırda; A100'e geç.
+#
+# - Çok yavaş -> max_depth 5 yerine 3 dene (2-3 dB SNR kaybı, hız 2-3x).
+#   Komut: --max_depth 3
+################################################################################

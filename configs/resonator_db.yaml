@@ -1,0 +1,51 @@
+# Aether Core — Spektral Barkod Veritabanı (SpectralBarcodeDB)
+# Kaynak: README.md → Modül 1 Adım 3 + Modül 4 Adım 4 + Tasarım Kararları
+#
+# Her ürün, S(f) Lorentzian formülüyle 7-bit Hamming codeword'a kodlanır:
+#   S(f) = ∏_{i=1..7} [ 1 - A_i · 1 / (1 + Q_i² (f/f_i - f_i/f)²) ]
+#
+# Eşleştirme (çift yol):
+#   1. identification_head 64-d L2-norm latent → cosine sim → ID lookup
+#   2. identification_head 7-bit binary tahmin → Hamming(7,4) decode → 4-bit data → ID
+
+# ── Şema (REVİZE 2026-05-14) ──────────────────────────────────
+encoding:
+  scheme: "hamming_7_4"           # tek-bit hata düzeltme
+  data_bits: 4                    # 16 unique ID
+  parity_bits: 3
+  codeword_bits: 7                # spektrumdaki fiziksel çentik sayısı
+
+# ── Rezonatör fiziksel tasarım ────────────────────────────────
+resonator:
+  # Ana tercih (jüri demosu için)
+  primary_type: "3d_printed_dielectric_block"
+  primary_material: "carbon_doped_pla"
+  primary_epsilon_r_range: [4.0, 6.0]
+  primary_q_factor_range: [100, 150]
+
+  # Yedek tercih (Q sınırda)
+  fallback_type: "passive_metal_strip"
+  fallback_q_factor_range: [40, 60]
+
+  # Spektrum yerleşimi (UWB BW = 500 MHz, merkez ~6.5 GHz)
+  spectrum_bandwidth_hz: 500.0e+6
+  spectrum_center_hz: 6.5e+9
+  notch_band_hz: 71.0e+6             # 500 MHz / 7 codeword bits
+  min_required_q: 91              # f_0 / notch_band
+
+# ── Ürün katalogu ─────────────────────────────────────────────
+# Her giriş bir ürünü temsil eder. Sentetik veri üretirken
+# bu listeden örnekleme yapılır; bitirme demosu için 6-16 arası
+# ürün tanımlanması yeterli.
+products: []
+# Şablon kayıt:
+# - id: "PROD-0001"
+#   data_bits: [1, 0, 1, 1]              # 4-bit data (0-15 arası ID)
+#   codeword_bits: [1, 1, 0, 0, 1, 1, 1] # Hamming(7,4) ile encode edilmiş 7-bit
+#   resonators:                          # 7 fiziksel rezonatör (her bit için bir)
+#     - f_hz: 6.214e+9
+#       A: 0.8                           # genlik (sönümleme derinliği)
+#       Q: 100
+#     # ... toplam 7 adet, codeword_bits=1 olanlar aktif çentik
+#   reference_signature_64d: null        # 64-d L2-norm vektör (eğitim sonrası)
+#   resonator_geometry_file: "models/PROD-0001.stl"  # 3D-printable tasarım

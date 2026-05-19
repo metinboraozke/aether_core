@@ -1,0 +1,31 @@
+# Aether Core — Anten ve Link konfigürasyonu (WiFi & UWB)
+# Kaynak: README.md → "Sionna Datasheet" → Bölüm 2 + 3
+
+esp32_nodes:
+  # 8 ESP32 düğümü; her biri hem TX hem RX olabilir.
+  count: 8
+  # TODO: her düğüm için [x, y, z] koordinatları (anten konumları)
+  positions_m: []   # örn: [[0.0, 0.0, 1.5], ...]
+
+links:
+  # C(8, 2) = 28 benzersiz link
+  count: 28
+  # Link geometrisi link_geo olarak modele beslenir (LinkGeometryEmbed → 64-d)
+
+wifi:
+  # Datasheet
+  center_freq_hz: 2.412e+9   # 2.412 GHz
+  bandwidth_hz: 40.0e+6        # 40 MHz (HT40)
+  n_subcarriers: 108        # ChannelResponse(H) çıktı genişliği
+  antenna_pattern: "dipole" # veya "monopole"
+
+uwb:
+  cir_taps: 32              # Tier 2 CIR girdisi
+  cfr_bins: 32              # Tier 3 CFR (FFT) girdisi
+  resample_grid_ns: 2.0     # Sinc-resample 2 ns grid
+  window_ns: 64.0           # First-path align sonrası 64 ns pencere
+
+ray_tracing:
+  max_depth: 5              # 3–5 yansıma; 2.4 GHz için en az 3
+  use_radio_map_solver: true
+  scenes_per_sample: 2      # 1) boş oda + 2) nesneli oda → CSI_Δ

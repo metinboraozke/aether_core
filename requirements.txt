@@ -1,0 +1,28 @@
+# Aether Core — Python bağımlılıkları
+# Kurulum: pip install -r requirements.txt
+# Not: Sionna 2.0, TensorFlow + CUDA bağımlılıklarıyla gelir; gerçek RT
+# simülasyonları için NVIDIA GPU şart koşulur.
+
+# ── Modül 1: Sionna 2.0 Veri Sentezi (Ray Tracing) ──
+sionna>=0.18
+tensorflow>=2.13
+mitsuba>=3.0
+
+# ── Modül 2 & 3 & 4: Pre-processing, Encoder, Brain (PyTorch tarafı) ──
+torch>=2.0
+numpy>=1.24
+scipy>=1.11
+pywavelets>=1.4
+
+# ── Konfigürasyon & yardımcı ──
+pyyaml>=6.0
+tqdm>=4.66
+
+# ── Modül 5: Backend (FastAPI + WebSocket) ──
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
+
+# ── Geliştirme & deney ──
+jupyter>=1.0
+matplotlib>=3.8

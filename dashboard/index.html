@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <title>Aether Core — 3D Voxel Digital Twin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body {
+      margin: 0; padding: 0;
+      height: 100%; width: 100%;
+      background: #0a0a0a; color: #e0e0e0;
+      font-family: 'Consolas', 'Monaco', monospace;
+      overflow: hidden;
+    }
+    #app { position: fixed; inset: 0; }
+    .hud {
+      position: fixed;
+      padding: 10px 14px;
+      background: rgba(0, 0, 0, 0.75);
+      border: 1px solid #333;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    #hud-top-left { top: 10px; left: 10px; }
+    #hud-top-right { top: 10px; right: 10px; min-width: 200px; }
+    #hud-bottom-left { bottom: 10px; left: 10px; max-width: 320px; }
+    .label { color: #888; }
+    .value { color: #4caf50; font-weight: bold; }
+    .warn { color: #ff9800; }
+    .err { color: #f44336; }
+    .legend-row { display: flex; align-items: center; margin: 3px 0; }
+    .legend-color {
+      display: inline-block;
+      width: 14px; height: 14px;
+      margin-right: 8px;
+      border-radius: 2px;
+    }
+    h3 { margin: 0 0 6px 0; font-size: 13px; color: #4caf50; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hud-top-left" class="hud">
+    <h3>AETHER CORE</h3>
+    <div><span class="label">WS:</span> <span id="ws-status" class="warn">connecting...</span></div>
+    <div><span class="label">FPS:</span> <span id="fps" class="value">--</span></div>
+    <div><span class="label">Inference:</span> <span id="inference-ms" class="value">--</span> ms</div>
+    <div><span class="label">Tick:</span> <span id="tick-count" class="value">0</span></div>
+  </div>
+
+  <div id="hud-top-right" class="hud">
+    <h3>SLOT DURUMU</h3>
+    <div id="slot-status">--</div>
+  </div>
+
+  <div id="hud-bottom-left" class="hud">
+    <h3>LEJANT</h3>
+    <div class="legend-row"><span class="legend-color" style="background:#c0c0c0"></span> Metal</div>
+    <div class="legend-row"><span class="legend-color" style="background:#4488ff"></span> Plastik</div>
+    <div class="legend-row"><span class="legend-color" style="background:#884422"></span> Ahşap</div>
+    <div class="legend-row"><span class="legend-color" style="background:#ddccaa"></span> Karton</div>
+    <div class="legend-row"><span class="legend-color" style="background:#666"></span> Boş</div>
+    <div style="margin-top:8px;font-size:11px;color:#888;">
+      Opacity = μ (Bayesian doluluk)<br>
+      Glow    = σ² (belirsizlik)
+    </div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

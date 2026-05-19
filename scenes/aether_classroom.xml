@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Aether Core — Sınıf/depo sahnesi (Mitsuba 3 + Sionna RT)
+
+  Geometri:
+    - Oda: 10 m × 5 m × 3 m (X × Y × Z)
+    - Köşeler: (0,0,0) → (10,5,3)
+    - 6 yüzey kutu (taban + tavan + 4 duvar, içe bakan normaller)
+    - 6 bölmeli açık dolap merkezde (3 sıra × 2 kolon)
+    - 6 slot içi placeholder cube (her örnekte malzeme runtime'da değişir)
+
+  Materyaller (Sionna RT runtime'da scene.get('id').radio_material ile değişir):
+    - itu_concrete   → duvarlar/tavan/taban
+    - itu_metal      → raf yüzeyi (PEC)
+    - itu_metal/itu_wood/itu_plastic → slot nesneleri (runtime'da rastgele)
+
+  NOT: Mitsuba 'cube' shape -1..+1 birim küptür; scale ile boyutlanır,
+       translate ile konumlanır. Sionna her shape'in id'si üzerinden
+       erişim sağlar (scene.get("...")).
+-->
+<scene version="3.0.0">
+
+  <integrator type="path"/>
+
+  <!-- Bir dummy sensor — Sionna RT için zorunlu değil ama Mitsuba parser
+       beklediği için ekliyoruz. Görselleştirme yaparsa kullanılır. -->
+  <sensor type="perspective">
+    <float name="fov" value="60"/>
+    <transform name="to_world">
+      <lookat origin="5, -5, 2" target="5, 2.5, 1.5" up="0, 0, 1"/>
+    </transform>
+    <film type="hdrfilm">
+      <integer name="width"  value="640"/>
+      <integer name="height" value="480"/>
+    </film>
+  </sensor>
+
+  <!-- ====================================================================
+       MATERYALLER (BSDF tanımları)
+       Sionna 2.0 RT zorunluluğu: BSDF id'leri 'mat-itu_<name>' formatında
+       olmalı. Sionna otomatik olarak ITU radio material'a dönüştürür.
+       Görsel diffuse renderlama yine çalışır; runtime'da
+       scene.get("slot_obj_X").radio_material = ITURadioMaterial(...) ile
+       slot küplerinin malzemesi her örnekte değiştirilir.
+       ==================================================================== -->
+
+  <bsdf type="diffuse" id="mat-itu_concrete">
+    <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
+  </bsdf>
+
+  <bsdf type="diffuse" id="mat-itu_metal">
+    <rgb name="reflectance" value="0.85, 0.85, 0.85"/>
+  </bsdf>
+
+  <bsdf type="diffuse" id="mat-itu_wood">
+    <rgb name="reflectance" value="0.5, 0.3, 0.2"/>
+  </bsdf>
+
+  <!-- ====================================================================
+       ODA — 6 yüzey kutu (içe bakan normaller)
+       Her yüzey 'rectangle' shape (-1..+1 düzlemi, normal = +Z)
+       to_world ile konum ve normal yönelimi ayarlanır.
+       ==================================================================== -->
+
+  <!-- TABAN — Z=0 düzlemi, normal +Z -->
+  <shape type="rectangle" id="floor">
+    <transform name="to_world">
+      <scale x="5" y="2.5"/>             <!-- 10×5 m oda → -5..+5, -2.5..+2.5 -->
+      <translate x="5" y="2.5" z="0"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- TAVAN — Z=3 düzlemi, normal -Z (180° X-rotation) -->
+  <shape type="rectangle" id="ceiling">
+    <transform name="to_world">
+      <scale x="5" y="2.5"/>
+      <rotate x="1" angle="180"/>
+      <translate x="5" y="2.5" z="3"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- DUVAR Y=0 (ön duvar), normal +Y → 90° X-rot -->
+  <shape type="rectangle" id="wall_front">
+    <transform name="to_world">
+      <scale x="5" y="1.5"/>             <!-- 10 m geniş, 3 m yüksek -->
+      <rotate x="1" angle="-90"/>
+      <translate x="5" y="0" z="1.5"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- DUVAR Y=5 (arka duvar), normal -Y -->
+  <shape type="rectangle" id="wall_back">
+    <transform name="to_world">
+      <scale x="5" y="1.5"/>
+      <rotate x="1" angle="90"/>
+      <translate x="5" y="5" z="1.5"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- DUVAR X=0 (sol duvar), normal +X -->
+  <shape type="rectangle" id="wall_left">
+    <transform name="to_world">
+      <scale x="1.5" y="2.5"/>
+      <rotate y="1" angle="90"/>
+      <translate x="0" y="2.5" z="1.5"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- DUVAR X=10 (sağ duvar), normal -X -->
+  <shape type="rectangle" id="wall_right">
+    <transform name="to_world">
+      <scale x="1.5" y="2.5"/>
+      <rotate y="1" angle="-90"/>
+      <translate x="10" y="2.5" z="1.5"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+
+  <!-- ====================================================================
+       RAF (Açık metal dolap) — merkezde, 1 m × 0.4 m × 1 m
+       Basit gösterim: tek bir dikdörtgen prizma (cube shape).
+       ==================================================================== -->
+
+  <shape type="cube" id="shelf_frame">
+    <transform name="to_world">
+      <scale x="0.5" y="0.2" z="0.5"/>   <!-- cube -1..+1 → 1×0.4×1 m -->
+      <translate x="5.0" y="2.5" z="1.5"/>
+    </transform>
+    <ref id="mat-itu_metal"/>
+  </shape>
+
+  <!-- ====================================================================
+       6 SLOT NESNESİ (placeholder cube'lar)
+       Sionna runtime'da:
+         - dolu slot → object_metal/wood/plastic/cardboard radio_material
+         - boş slot  → vacuum/itu_air radio_material (yansıma vermez)
+       Boyut: 0.4 × 0.3 × 0.25 m (slot içine sığacak)
+       Konum: configs/scene.yaml > slot_centers_m
+       ==================================================================== -->
+
+  <!-- S1 üst-sol -->
+  <shape type="cube" id="slot_obj_1">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="1.83"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+  <!-- S2 üst-sağ -->
+  <shape type="cube" id="slot_obj_2">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="1.83"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+  <!-- S3 orta-sol -->
+  <shape type="cube" id="slot_obj_3">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="1.50"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+  <!-- S4 orta-sağ -->
+  <shape type="cube" id="slot_obj_4">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="1.50"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+  <!-- S5 alt-sol -->
+  <shape type="cube" id="slot_obj_5">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="4.75" y="2.5" z="1.17"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+  <!-- S6 alt-sağ -->
+  <shape type="cube" id="slot_obj_6">
+    <transform name="to_world">
+      <scale x="0.20" y="0.15" z="0.125"/>
+      <translate x="5.25" y="2.5" z="1.17"/>
+    </transform>
+    <ref id="mat-itu_wood"/>
+  </shape>
+
+</scene>

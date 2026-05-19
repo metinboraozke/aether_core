@@ -1,0 +1,226 @@
+================================================================================
+BİLİNEN RİSKLER ENVANTERİ — AETHER CORE
+================================================================================
+Tarih: 2026-05-15
+Her risk için: tanım, etki, hafifletme, ele alındığı modül.
+
+
+================================================================================
+KOD/PIPELINE RİSKLERİ
+================================================================================
+
+R1) Sionna API minor sürüm uyumsuzluğu
+    Tanım: Sionna 2.0.x sürümleri arasında load_scene, PathSolver, paths.cir
+           imzaları değişebilir (özellikle squeeze/shape behavior).
+    Etki: Hücre 5 veya 6'da exception → veri üretimi başlamaz.
+    Hafifletme: Generate script'leri esnek squeeze mantığı kullanır.
+                Hata gelirse stack trace + sionna.__version__ ile düzeltme.
+    Ele alındığı yer: data_synthesis/generate_*_sionna.py + COLAB_RUN.txt
+                      "SORUN ÇIKARSA" bölümü
+
+
+R2) ITURadioMaterial preset adı eşleşmezliği
+    Tanım: Bazı preset isimleri ('vacuum', 'plywood') Sionna 2.0'da
+           olmayabilir veya farklı isimle vardır.
+    Etki: assign_slot_materials'da exception yakalanır, varsayılan kullanılır
+          → boş slot ile dolu slot ayrımı zayıflar.
+    Hafifletme: Hücre 6 paired sample test ettiğinde uyarı mesajı görünür;
+                gerekirse iturm_map sözlüğü güncellenir.
+    Ele alındığı yer: data_synthesis/generate_hybrid_sionna.py
+
+
+R3) Path tau float32 hassasiyet (10⁻⁹ saniye)
+    Tanım: UWB delay saniye mertebesinde küçük, float32 epsilon ~10⁻⁷ sınırına
+           yakın.
+    Etki: PathAuxHead MSE loss'unda gradient instability.
+    Hafifletme: Modül 2 preprocessing'te tau normalize:
+                tau_normalized = tau_seconds * 1e9 / max_window_ns (örn 64 ns)
+                → [0, 1] aralığı.
+    Ele alındığı yer: preprocessing/tensor_format.py (henüz YOK, M2'de eklenecek)
+
+
+R4) WiFi "sadece nesneli pass" path_params teorik tutarsızlığı
+    Tanım: csi_delta = full - ref diferansiyel ama path_params full pass'i.
+           Model fark sinyalden tüm path'leri tahmin etmeye zorlanıyor.
+    Etki: Auxiliary loss konverjansı yavaş olabilir.
+    Hafifletme: Şu hâliyle test et; sonuç zayıfsa "nesne path'leri izole etme"
+                stratejisi (full ile ref path setleri matching).
+    Ele alındığı yer: data_synthesis/generate_wifi_csi_sionna.py
+
+
+R5) Path-aware auxiliary supervision test edilmedi (hipotez)
+    Tanım: Modül 3-4 implement edildikten sonra ablation çalışması zorunlu.
+           Eğer λ_aux=0 ile main task accuracy aynı çıkıyorsa, eklenti gereksiz.
+    Etki: Storage israfı (~4.5 GB / 500k), eğitim süresi artışı.
+    Hafifletme: Ablation çalışması (training/ablation.py'da no_path_aux varyantı).
+    Ele alındığı yer: training/ablation.py
+
+
+================================================================================
+DONANIM / GERÇEK DÜNYA RİSKLERİ
+================================================================================
+
+R6) ESP32 + UWB senkronizasyon zamanlama hatası
+    Tanım: NTP via lab WiFi ile saatler genelde ±10 ms hassasiyetle eşleşir;
+           ESP32 ~1 ms tipik ama UWB DW1000 daha karışık (kendi saati var).
+    Etki: sync_buffer'da drop_ticks > %30 olursa inference rate düşer.
+    Hafifletme: Hardware GPIO master trigger (1 ESP32 master pin) — donanım
+                eklemesi, proje ölçeğinde opsiyonel.
+                Tolerance window ±5 ms → ±10 ms genişlet (config'te).
+    Ele alındığı yer: backend/sync_buffer.py + telemetry monitoring
+
+
+R7) Hibrit topoloji — master cihazlarda anten interferansı
+    Tanım: M1..M4'te ESP32 + UWB yan yana PCB'ler. WiFi 2.4 GHz ile UWB 6.5 GHz
+           farklı bantlar ama yakın alan interferansı olabilir.
+    Etki: SNR düşer, özellikle rezonatör imzası bozulur.
+    Hafifletme: PCB'leri 10+ cm ayrı koy; metal shield, ayrı antenler farklı
+                yönelimde (WiFi PCB anten, UWB chip antenna).
+    Ele alındığı yer: Donanım kurulum dokümantasyonu (proje dışı)
+
+
+R8) Adaptive baseline "yanlış quiet" tespiti
+    Tanım: Detection head yanlışlıkla "tüm slot boş" derse, dolu odanın
+           CSI'sini baseline olarak alır → sistem körleşir.
+    Etki: Tüm tahminler 'boş' olur, sistem demoda çöker.
+    Hafifletme: Multiple sanity check:
+                - Total energy threshold (boş oda için tipik enerji aralığı)
+                - Tracker presence=False kontrolü (motion yok)
+                - Manuel pause: jüri demosunda detection_mask manuel olarak
+                  doğrulanmadan baseline güncellenmesin.
+    Ele alındığı yer: preprocessing/differential_csi.py + backend/inference_server.py
+
+
+R9) Sliding window "warming up" 5 sn jüri sunumunda göze batar
+    Tanım: TrackingEngine ilk 100 örnek (5 sn @ 20 Hz) boyunca WARMING_UP.
+    Etki: Demo başlangıcında "tahmin yok" görünür.
+    Hafifletme: Server start'tan sonra otomatik 5 sn buffer doldurma fazı,
+                dashboard'da "WARMING UP 67%" progress bar göster.
+    Ele alındığı yer: dashboard/main.js HUD overlay + tracker fill_ratio()
+
+
+================================================================================
+EĞİTİM / MODELLEME RİSKLERİ
+================================================================================
+
+R10) DANN λ schedule fazla agresif
+     Tanım: Klasik formül p=0.5'te λ≈0.46, recognition'ı erken epoch'ta zayıflatır.
+     Etki: 16 ID classification başarısı düşer.
+     Hafifletme: REVİZE configs/training.yaml:
+                 dann_warmup_epochs=3, dann_max_lambda=0.7 cap.
+                 Ablation: λ_max ∈ {0.3, 0.5, 0.7, 1.0} dene.
+     Ele alındığı yer: adaptation/dann.py + training/ablation.py
+
+
+R11) Top-20 path cap'i bazı slotlarda yetersiz
+     Tanım: Bazı sahnelerde Sionna 50+ path bulur, top-20 zayıflar.
+     Etki: Path-aware supervision sinyali eksik.
+     Hafifletme: validity_mask sayesinde padding'e loss uygulanmaz;
+                 20 yetmiyorsa max_paths=30 yap (storage etkisi: %50 artar).
+     Ele alındığı yer: data_synthesis/generate_*_sionna.py compute_*_cir
+
+
+R12) Multi-domain dataset boyut dengesizliği
+     Tanım: Eğer 1 preset 100k, diğeri 10k'da kalırsa loader batch
+            örnekleme dengesiz → model dominant preset'e overfit.
+     Etki: Diğer preset'lerde accuracy düşer.
+     Hafifletme: WeightedRandomSampler (her preset eşit ağırlık) veya
+                 her preset'i aynı sample sayısında üret.
+     Ele alındığı yer: data_synthesis/multi_domain_dataset.py + training/train.py
+
+
+R13) Real-time latency hedefi (200 ms) zorlanır
+     Tanım: Modül 2 preprocessing + Modül 3+4 forward + WS broadcast toplam
+            > 200 ms olabilir (özellikle CPU inference).
+     Etki: Tracking gecikmesi, hareketli nesne UI'de "kayar".
+     Hafifletme: Knowledge Distillation (Modül 5 Adım 5) — Student model
+                 < 50 ms forward. Eğer hala yetmezse:
+                 - TensorRT/ONNX dönüşüm
+                 - Async pipelined inference (predict t için preprocess t+1)
+     Ele alındığı yer: adaptation/distillation.py + backend/inference_server.py
+
+
+================================================================================
+JÜRİ SUNUMU RİSKLERİ
+================================================================================
+
+R14) Demoda fiziksel rezonatör soru
+     Tanım: Jüri "rezonatör nasıl üretildi?" diye soracak.
+     Etki: Cevap yoksa proje "tamamlanmamış" görünür.
+     Hafifletme: 3D-printed karbon-katkılı PLA dielektrik blok kararı
+                 (memory/project_decisions.md). 1-2 örnek bloğun gerçek
+                 fotoğrafı + Q ölçümü (network analyzer ile) sunum slaytında.
+     Ele alındığı yer: README + sunum hazırlığı
+
+
+R15) Real fine-tune (1-2 gün) yetmezse accuracy düşük
+     Tanım: PDF planı 1-2 gün gerçek ortam fine-tune; jüri sorabilir
+            "neden gerçek dünyada model %60'a düşmüş?"
+     Etki: Demo başarısız algılanır.
+     Hafifletme: Realistic expectation slide:
+                 "Sentetik %95+ / Gerçek baseline %60-75 / Fine-tune sonrası %80+"
+                 Net dürüst bir performans grafiği.
+     Ele alındığı yer: Sunum slaytı, README "Geliştirme Yol Haritası" bölümü
+
+
+R16) "Stok takibi nerede?" sorusu
+     Tanım: PDF'in uzun vadeli vizyonu depo lojistik, ama MVP scope OUT.
+     Etki: Jüri "tamamlanmamış proje" sanabilir.
+     Hafifletme: Scope açık beyanat:
+                 IN  = 3D TSDF + ürün tipi + rezonatör ID + dashboard
+                 OUT = stok takibi (DB entegrasyonu, persistance)
+                 → "Phase 2 roadmap" slaytı: stok takibi eklemenin nasıl
+                   yapılacağı (ID + timestamp DB schema, kısa demo plan).
+     Ele alındığı yer: memory/project_mvp_scope.md + sunum
+
+
+================================================================================
+RISK ÖZET TABLOSU
+================================================================================
+
+KRİTİK   (jüri öncesi mutlaka kapatılmalı):
+  R6  ESP32-UWB sync timing
+  R8  Adaptive baseline yanlış-quiet
+  R14 Rezonatör fiziksel tasarımı
+  R15 Real fine-tune accuracy gerçekçi beklenti
+
+YÜKSEK   (Modül implementasyonunda ele alınır):
+  R1  Sionna API uyumsuzluğu
+  R3  Path tau float32 normalize
+  R10 DANN λ agresifliği
+  R13 Real-time latency
+
+ORTA     (test edilir, gerekirse düzeltilir):
+  R2  ITU material isimleri
+  R4  WiFi path tutarsızlığı
+  R5  Path-aux ablation
+  R7  Hibrit anten interferansı
+  R9  Sliding window warming UX
+  R11 Top-20 path cap
+  R12 Multi-domain dengesizlik
+  R16 Stok takibi scope iletişimi
+
+
+================================================================================
+KARARLAR / UYGULAMA TAKVİMİ
+================================================================================
+
+  Faz 0 mini veri üretimi sonrası:
+    R1, R2 erken yakalanır (Hücre 5/6 sanity)
+
+  Modül 2 implementasyon:
+    R3 (tau normalize) — preprocessing/tensor_format.py
+    R8 (yanlış-quiet sanity check) — preprocessing/differential_csi.py iyileştirme
+
+  Modül 3-4 implementasyon:
+    R5, R11 (ablation hazırlığı)
+
+  Modül 5 + backend:
+    R6 (sync drop telemetry monitoring)
+    R10 (DANN λ tune)
+    R13 (latency ölçüm + distillation)
+
+  Sunum hazırlık:
+    R14 (rezonatör örnek üretim)
+    R15 (performans grafiği)
+    R16 (scope iletişim slaytı)

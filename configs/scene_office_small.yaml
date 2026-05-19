@@ -1,0 +1,79 @@
+# Aether Core — PRESET: office_small (6 × 4 × 2.5 m, hibrit topoloji)
+# REVİZE 2026-05-15: 4 master + 4 satellite, UWB Round-Robin TDMA 6 bistatic link
+
+domain:
+  name: "office_small"
+  description: "Küçük ofis ortamı, dar hacim, yakın yansıma"
+  master_seed: 242
+
+room:
+  width_m: 6.0
+  depth_m: 4.0
+  height_m: 2.5
+
+shelf:
+  n_slots: 6
+  grid: [3, 2]
+  center_xyz_m: [3.0, 2.0, 1.2]
+  size_xyz_m: [1.0, 0.4, 1.0]
+  slot_size_m: [0.5, 0.4, 0.33]
+
+slot_centers_m:
+  - [2.75, 2.0, 1.53]
+  - [3.25, 2.0, 1.53]
+  - [2.75, 2.0, 1.20]
+  - [3.25, 2.0, 1.20]
+  - [2.75, 2.0, 0.87]
+  - [3.25, 2.0, 0.87]
+
+nodes:
+  - {id: "M1", type: "master",    position_m: [2.6, 2.0, 2.45], sensors: ["esp32", "uwb"]}
+  - {id: "M2", type: "master",    position_m: [3.4, 2.0, 2.45], sensors: ["esp32", "uwb"]}
+  - {id: "M3", type: "master",    position_m: [0.3, 0.3, 2.20], sensors: ["esp32", "uwb"]}
+  - {id: "M4", type: "master",    position_m: [3.0, 2.0, 2.00], sensors: ["esp32", "uwb"]}
+  - {id: "S1", type: "satellite", position_m: [0.3, 0.3, 0.6],  sensors: ["esp32"]}
+  - {id: "S2", type: "satellite", position_m: [5.7, 0.3, 0.6],  sensors: ["esp32"]}
+  - {id: "S3", type: "satellite", position_m: [0.3, 3.7, 0.6],  sensors: ["esp32"]}
+  - {id: "S4", type: "satellite", position_m: [5.7, 3.7, 0.6],  sensors: ["esp32"]}
+
+wifi:
+  freq_hz: 2.412e+9
+  bandwidth_hz: 40.0e+6
+  n_subcarriers: 108
+
+uwb:
+  freq_hz: 6.5e+9
+  bandwidth_hz: 500.0e+6
+  n_taps: 32
+  tap_dt_ns: 2.0
+  window_ns: 64.0
+  tdma_cycle_ms: 40.0
+  tdma_slot_ms: 10.0
+
+materials:
+  walls_concrete:
+    iturm: "plasterboard"          # ofis ince duvarlar
+    epsilon_r_range: [2.5, 3.5]
+    scattering: "lambertian"
+  shelf_metal:
+    iturm: "metal"
+    pec: true
+    scattering: "specular"
+  object_metal: { iturm: "metal" }
+  object_plastic: { epsilon_r_range: [2.5, 3.5] }
+  object_wood: { epsilon_r_range: [2.0, 3.0] }
+  object_cardboard: { epsilon_r_range: [1.5, 2.0] }
+  resonator_pla_carbon:
+    epsilon_r_range: [4.0, 6.0]
+    q_factor_range: [100, 150]
+    block_size_mm: [40, 40, 10]
+
+randomization:
+  slot_position_jitter_mm: 5.0
+  slot_rotation_jitter_deg: 15.0
+  slot_fill_probability: 0.6
+  noise:
+    cfo_phase_max_rad: 3.14159
+    agc_gain_db_range: [-6.0, 6.0]
+    wifi_interferer_count_max: 5
+    bt_burst_dropout_prob: 0.08

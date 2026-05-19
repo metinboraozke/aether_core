@@ -1,0 +1,244 @@
+================================================================================
+MODÜL 2 — PREPROCESSING PIPELINE (DETAYLI REHBER)
+================================================================================
+Tarih: 2026-05-15
+Status: ✅ TAMAMLANDI 2026-05-15 — 6/6 dosya gerçek + __init__.py wrapper
+        Gerçek 5k veri ile birim test geçti.
+
+Implementasyon özet:
+  preprocess_csi (full pipeline):  8.46 ms/sample
+  preprocess_uwb (full pipeline):  0.18 ms/sample
+  Output shape: CSI (B,28,2,108) + UWB (B,6,2,32), range [-1, 1] per-link norm
+  AdaptiveBaseline (B+A combo): inference path için drift düzeltmesi
+  path_params tau ns/64 normalize (R3 risk hafifletmesi)
+
+Bu dosya sonraki implementasyonlar için REFERANS olarak kalıyor.
+Detaylı kayıt: memory/project_decisions.md "2026-05-15 FAZ 1 TAMAMLANDI"
+
+HEDEF
+  PDF Modül 2 (Çok Kademeli Ön İşleme) 6 adımının tamamı çalışır kod.
+  Girdi:  data/<preset>/csivec_delta.npy [N, 28, 108, 2]
+          data/<preset>/uwb_cir_anchor.npy [N, 6, 32, 2]
+  Çıktı:  model'e doğrudan beslenecek hale getirilmiş [-1, 1] tensörler
+
+
+================================================================================
+DOSYALAR + SORUMLULUKLAR
+================================================================================
+
+1) preprocessing/phase_sanitize.py  (YENİ)
+   ─────────────────────────────────
+   Sorumluluk: WiFi CSI faz verisinin temizlenmesi.
+   Fonksiyonlar:
+     unwrap_phase(csi: np.ndarray) -> np.ndarray
+       Input:  csi (..., n_subcarriers, 2)  real/imag
+       Output: aynı shape, ama subcarrier ekseninde unwrap
+       Implementasyon: np.unwrap(np.angle(complex), axis=-1)
+
+     remove_linear_phase(csi: np.ndarray) -> np.ndarray
+       Sub-carrier indeksine karşı faz lineer fit (least squares),
+       eğim ve offset çıkarılır.
+       Math: phi(k) = a*k + b; ph_clean = phi - (a*k + b)
+
+     apply_static_offset(csi, csi_ref) -> np.ndarray
+       csi_ref: boş oda referansı (her link için sabit faz offseti)
+       csi'nin fazından csi_ref'in fazını çıkar (link bazlı normalize).
+
+   Test stratejisi:
+     synthetic input: phi(k) = 2π·k/100 + π·k²/200 + noise
+     beklenen: unwrap doğru sıçramaları temizler, linear fit eğimi kaldırır.
+
+   Bağımlılık: numpy
+
+
+2) preprocessing/agc_normalize.py  (YENİ)
+   ───────────────────────────────────
+   Sorumluluk: Genlik düzeltmesi + outlier clipping + log-scale.
+   Fonksiyonlar:
+     agc_normalize(csi: np.ndarray) -> np.ndarray
+       Her link için RMS=1'e normalize (per-sample, per-link).
+       NOT: noise_models.apply_agc'den farklı — burası DETERMINISTIC
+       (RNG yok). İnference path'te kullanılır.
+
+     clip_outliers(csi: np.ndarray, k: float = 3.0) -> np.ndarray
+       Per-link μ ± k·σ dışındaki değerleri kırp.
+
+     to_db(csi: np.ndarray, eps: float = 1e-12) -> np.ndarray
+       Genlik logaritması: 20 * log10(|csi| + eps)
+       Faz korunur veya ayrı channel olarak işlenir.
+
+   Test stratejisi:
+     csi = 0.01 * randn(28, 108, 2)
+     out = agc_normalize(csi)
+     assert np.allclose(rms(out), 1.0, atol=0.1)
+
+   Bağımlılık: numpy
+
+
+3) preprocessing/differential_csi.py  (✓ TAMAMLANDI)
+   ─────────────────────────────────────────────
+   AdaptiveBaseline class hazır (B + A combo).
+   Modül 2 implementasyonunda DEĞİŞİKLİK YOK.
+
+
+4) preprocessing/dwt_denoise.py  (YENİ)
+   ───────────────────────────────────
+   Sorumluluk: DWT ile gürültü temizleme (PyWavelets).
+   Fonksiyonlar:
+     dwt_denoise(csi: np.ndarray,
+                 wavelet: str = 'db4',
+                 level: int = 3,
+                 threshold_mode: str = 'soft') -> np.ndarray
+       1. pywt.wavedec(csi, wavelet, level=level)
+       2. Yüksek frekans katsayılarına soft-thresholding (sigma * sqrt(2*log(N)))
+       3. pywt.waverec — geri inşa
+       4. Subcarrier ekseninde uygulanır
+
+   Test stratejisi:
+     clean = sin pattern
+     noisy = clean + 0.5 * randn
+     denoised = dwt_denoise(noisy)
+     assert MSE(denoised, clean) < MSE(noisy, clean)
+
+   Bağımlılık: pywt (PyWavelets), numpy
+
+
+5) preprocessing/uwb_resample.py  (YENİ)
+   ────────────────────────────────────
+   Sorumluluk: UWB CIR'ı standart 2 ns grid'ine sinc-resample + first-path align.
+   Fonksiyonlar:
+     sinc_resample(cir: np.ndarray,
+                   src_dt_ns: float,
+                   tgt_dt_ns: float = 2.0,
+                   n_taps_out: int = 32) -> np.ndarray
+       Sinc interpolation (scipy.signal.resample veya manuel).
+       Sionna'dan gelen CIR zaten 2 ns'lik, bu fonksiyon real ESP32 verisi
+       için. Bizim sentetik veri için NO-OP.
+
+     align_first_path(cir: np.ndarray,
+                      threshold_db: float = -10.0) -> np.ndarray
+       İlk path tepesini bul (envelope'da threshold geçişi),
+       CIR'ı bu tepe noktasına göre kaydır (np.roll).
+
+     window_cir(cir: np.ndarray,
+                window_ns: float = 64.0,
+                tap_dt_ns: float = 2.0) -> np.ndarray
+       İlk N tap'i al (window_ns / tap_dt_ns = 32 tap), gerisini at.
+       Sionna verisi zaten 32 tap → NO-OP.
+
+   Test stratejisi:
+     impulse @ tap 10
+     aligned = align_first_path(impulse)
+     assert argmax(aligned) == 0
+
+   Bağımlılık: numpy, scipy.signal
+
+
+6) preprocessing/tensor_format.py  (YENİ)
+   ─────────────────────────────────────
+   Sorumluluk: Modele girmeden son tensor formatlaması + normalize.
+   Fonksiyonlar:
+     to_model_shape_csi(csi: np.ndarray) -> np.ndarray
+       Input:  (..., 28, 108, 2)
+       Output: (..., 28, 2, 108)   # CSI Transformer'ın beklediği şekil
+       Sadece axis swap.
+
+     to_model_shape_uwb(cir: np.ndarray) -> np.ndarray
+       Input:  (..., 6, 32, 2)
+       Output: (..., 6, 2, 32)
+       Sadece axis swap.
+
+     normalize_minus1_1(x: np.ndarray,
+                        per_link: bool = True) -> np.ndarray
+       Per-link min-max normalize → [-1, 1].
+       Per-link: her link kendi min/max'ına göre normalize edilir
+                 (cross-link relative scale kaybedilir ama train stability artar)
+       Global: tüm tensör tek min/max ile normalize (relative korunur).
+
+   Test stratejisi:
+     out = normalize_minus1_1(np.random.randn(10, 28, 108, 2))
+     assert -1.0 <= out.min() and out.max() <= 1.0
+
+   Bağımlılık: numpy
+
+
+================================================================================
+ANA PIPELINE WRAPPER (preprocessing/__init__.py — opsiyonel)
+================================================================================
+
+def preprocess_csi(csi_raw, baseline: AdaptiveBaseline = None,
+                   apply_dwt: bool = True) -> torch.Tensor:
+    """End-to-end CSI preprocessing pipeline."""
+    csi = phase_sanitize.unwrap_phase(csi_raw)
+    csi = phase_sanitize.remove_linear_phase(csi)
+    csi = agc_normalize.agc_normalize(csi)
+    csi = agc_normalize.clip_outliers(csi, k=3.0)
+    if baseline is not None:
+        csi = baseline.compute_delta(csi)
+    if apply_dwt:
+        csi = dwt_denoise.dwt_denoise(csi, wavelet='db4', level=3)
+    csi = tensor_format.normalize_minus1_1(csi)
+    csi = tensor_format.to_model_shape_csi(csi)
+    return torch.from_numpy(csi).float()
+
+
+def preprocess_uwb(cir_raw) -> torch.Tensor:
+    """End-to-end UWB CIR preprocessing pipeline (sentetik için NO-OP ağırlıklı)."""
+    cir = uwb_resample.align_first_path(cir_raw)
+    cir = uwb_resample.window_cir(cir, window_ns=64.0)
+    cir = tensor_format.normalize_minus1_1(cir)
+    cir = tensor_format.to_model_shape_uwb(cir)
+    return torch.from_numpy(cir).float()
+
+
+================================================================================
+ENTEGRASYON NOKTALARI
+================================================================================
+
+- Train sırasında: DataLoader collate_fn içinde preprocess_csi / preprocess_uwb
+- Inference sırasında: backend/inference_server.py her tick'te çağırır
+- AdaptiveBaseline yalnızca INFERENCE path'inde (sentetik veri zaten temiz)
+
+
+================================================================================
+TEST DOSYASI (yeni: tests/test_preprocessing.py)
+================================================================================
+
+def test_phase_sanitize():
+    csi = np.exp(1j * 2 * np.pi * np.arange(108) / 20).astype(np.complex64)
+    csi_ri = np.stack([csi.real, csi.imag], axis=-1)
+    out = phase_sanitize.unwrap_phase(csi_ri[None, :, :])
+    assert out.shape == (1, 108, 2)
+
+def test_agc_normalize():
+    csi = np.random.randn(28, 108, 2) * 0.001
+    out = agc_normalize.agc_normalize(csi)
+    rms_per_link = np.sqrt(np.mean(out ** 2, axis=(-1, -2)))
+    assert np.allclose(rms_per_link, 1.0, atol=0.5)
+
+def test_dwt_denoise():
+    clean = np.sin(2 * np.pi * np.arange(108) / 20)
+    noisy = clean + 0.2 * np.random.randn(108)
+    den = dwt_denoise.dwt_denoise(noisy[None, None, :, None])
+    assert np.mean((den.squeeze() - clean) ** 2) < np.mean((noisy - clean) ** 2)
+
+
+================================================================================
+KOŞULSUZLUKLAR (BU MODÜL İÇİN)
+================================================================================
+
+- DWT'nin kompleks input kabul etmesi gerek (PyWavelets default'ta float).
+  Real ve imag ayrı denoise edilebilir veya complex wavelet kullanılır.
+- normalize_minus1_1 per-link MOD seçimi mimari'ye etki eder; transformer
+  link-relative information kaybedebilir. Default: per-link, ablation'da test.
+- Adaptive baseline INFERENCE-only; training collate_fn'inde KULLANILMAZ
+  (sentetik veri zaten ideal differential).
+
+
+================================================================================
+TAHMİNİ İŞ HACMİ
+================================================================================
+
+  600 satır Python (yorum dahil ~800 satır)
+  Tek mesaj
+  Birim testler ~150 satır

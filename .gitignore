@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Sanal ortam
+.venv/
+venv/
+env/
+
+# Veri ve checkpoint (büyük dosyalar) — alt klasörler dahil
+data/**/*.npy
+data/**/*.h5
+data/**/*.tfrecord
+data/**/*.yaml
+!data/.gitkeep
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+checkpoints/**/*.ckpt
+checkpoints/**/*.tflite
+checkpoints/**/*.onnx
+!checkpoints/.gitkeep
+
+# Eğitim ve test çıktıları (her koşumda yeniden üretilir)
+training/ablation_results.json
+training/*.log
+training/runs/
+
+# Datasheet PDF (kullanıcının yerel referansı, repo'da README var)
+DATASHEETTTTTTT.pdf
+
+# Sionna / Mitsuba ara çıktılar
+*.exr
+*.mitsuba
+scenes/__cache__/
+
+# Notebook checkpoint
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+runs/
+wandb/

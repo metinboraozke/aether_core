@@ -28,10 +28,23 @@ model:
   path_aux_max_paths: 20         # path_params teacher pad
 
 train:
-  batch_size: null               # TODO
-  learning_rate: null            # TODO
+  batch_size: 64                 # production önerisi (mini test: 16)
+  learning_rate: 1.0e-3          # peak lr (warmup sonrası, cosine başı)
   optimizer: "adamw"
-  epochs: null                   # TODO
+  weight_decay: 1.0e-4
+  epochs: 40                     # production önerisi (mini test: 2)
+
+# ── LR Scheduler (2026-05-19) ──
+# Multi-domain için TEK warmup+cosine, restart yok. Domain shift "anı" yok
+# (interleaved shuffle batching), bu yüzden tek scheduler tüm preset/variantlar
+# boyunca devam eder. Mini test (epochs <= warmup_epochs) durumunda otomatik
+# devre dışı kalır (sabit lr fallback).
+lr_scheduler:
+  type: "warmup_cosine"          # LinearLR + CosineAnnealingLR (SequentialLR)
+  warmup_epochs: 2               # 0 = scheduler kapalı (sabit lr)
+  warmup_start_factor: 0.01      # warmup başında lr = peak * factor
+  eta_min: 1.0e-5                # cosine'in ulaşacağı min lr
+  # Profil (epochs=40): ep 0-2 warmup 1e-5→1e-3, ep 2-40 cosine 1e-3→1e-5
 
 losses:
   detection: "bce"

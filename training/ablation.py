@@ -31,7 +31,9 @@ from data_synthesis.multi_domain_dataset import (
     MultiDomainDataset, collate_with_preprocess,
 )
 from models.fused_model import FusedCSIUWBNet, DEFAULT_LAMBDAS
-from training.train import train_baseline, create_optimizer
+from training.train import (
+    train_baseline, create_optimizer, create_scheduler,
+)
 from training.eval import evaluate
 
 
@@ -63,8 +65,14 @@ def run_single_ablation(
     epochs: int,
     device: str,
     lr: float = 1e-3,
+    warmup_epochs: int = 2,
+    eta_min: float = 1e-5,
 ) -> dict:
-    """Tek bir varyantı eğit + eval."""
+    """Tek bir varyantı eğit + eval.
+
+    LR scheduler (warmup + cosine) tüm varyantlara aynı uygulanır → adil
+    karşılaştırma. warmup_epochs=0 verilirse scheduler kapanır (sabit lr).
+    """
     print(f"\n{'='*60}")
     print(f"ABLATION: {variant['name']}")
     print(f"{'='*60}")
@@ -75,17 +83,29 @@ def run_single_ablation(
 
     model = FusedCSIUWBNet().to(device)
     optimizer = create_optimizer(model, lr=lr)
+    if warmup_epochs > 0 and epochs > warmup_epochs:
+        scheduler = create_scheduler(
+            optimizer, total_epochs=epochs,
+            warmup_epochs=warmup_epochs, eta_min=eta_min,
+        )
+    else:
+        scheduler = None  # Çok az epoch (mini test) → scheduler devre dışı
 
     t_start = time.perf_counter()
     train_history = train_baseline(
         model, train_loader, epochs=epochs, optimizer=optimizer,
         device=device, lambdas=lambdas, use_aux=use_aux,
         verbose=False, log_every=999,
+        scheduler=scheduler,
     )
     train_time = round(time.perf_counter() - t_start, 2)
 
     print(f"  Eğitim süresi: {train_time}s")
     print(f"  Train L final: {train_history[-1]['total']:.4f}")
+    if scheduler is not None:
+        lrs = [h['lr'] for h in train_history]
+        print(f"  LR profili: {lrs[0]:.2e} → {lrs[-1]:.2e} "
+              f"(peak {max(lrs):.2e} @ ep {lrs.index(max(lrs))+1})")
 
     # Eval
     val_metrics = evaluate(model, val_loader, device=device, return_aux=False)
@@ -112,11 +132,17 @@ def run_ablation(
     val_split: float = 0.2,
     device: str = "cpu",
     lr: float = 1e-3,
+    warmup_epochs: int = 2,
+    eta_min: float = 1e-5,
     out_path: str = "training/ablation_results.json",
     variants: list[dict] | None = None,
     seed: int = 42,
 ) -> list[dict]:
-    """5 varyantı sırayla koştur, sonuçları JSON'a kaydet."""
+    """5 varyantı sırayla koştur, sonuçları JSON'a kaydet.
+
+    Tüm varyantlar AYNI LR schedule (warmup + cosine) ile eğitilir →
+    flag'ler dışındaki tek değişken kalmaz.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -148,6 +174,7 @@ def run_ablation(
         res = run_single_ablation(
             v, train_loader, val_loader,
             epochs=epochs, device=device, lr=lr,
+            warmup_epochs=warmup_epochs, eta_min=eta_min,
         )
         results.append(res)
 
@@ -183,8 +210,14 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--device", default="cpu")
     p.add_argument("--out", default="training/ablation_results.json")
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--warmup_epochs", type=int, default=2,
+                   help="Lineer warmup epoch'ları (0 = scheduler kapalı)")
+    p.add_argument("--eta_min", type=float, default=1e-5,
+                   help="Cosine annealing min lr")
     args = p.parse_args()
     run_ablation(
         epochs=args.epochs, batch_size=args.batch_size,
         device=args.device, out_path=args.out,
+        lr=args.lr, warmup_epochs=args.warmup_epochs, eta_min=args.eta_min,
     )

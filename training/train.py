@@ -39,6 +39,72 @@ def create_optimizer(model: torch.nn.Module, lr: float = 1e-3,
     return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
+def create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+    warmup_epochs: int = 2,
+    eta_min: float = 1e-5,
+    warmup_start_factor: float = 0.01,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Lineer warmup + cosine annealing (sequential).
+
+    Multi-domain eğitim için TEK scheduler — tüm preset/variant'lar boyunca
+    devam eder. Domain shift "anı" yok (interleaved batching), o yüzden
+    restart gerekmez.
+
+    Profil (total_epochs=40, warmup_epochs=2):
+        Epoch 0-2: lr 1e-5 → 1e-3   (lineer warmup, büyük model + DANN için)
+        Epoch 2-40: lr 1e-3 → 1e-5  (cosine annealing)
+
+    Args:
+        optimizer: AdamW (lr = peak lr, warmup start_factor ile çarpılır)
+        total_epochs: tüm eğitim süresinin epoch sayısı
+        warmup_epochs: lineer warmup süresi
+        eta_min: cosine'in sonunda lr ulaşacağı taban
+        warmup_start_factor: warmup başlangıcında lr * factor (0.01 = peak/100)
+
+    Returns:
+        SequentialLR — her epoch sonunda .step() çağrılmalı
+    """
+    if total_epochs <= warmup_epochs:
+        raise ValueError(
+            f"total_epochs ({total_epochs}) > warmup_epochs ({warmup_epochs}) olmalı"
+        )
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=warmup_start_factor,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_epochs - warmup_epochs,
+        eta_min=eta_min,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
+def create_optimizer_and_scheduler(
+    model: torch.nn.Module,
+    total_epochs: int,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    warmup_epochs: int = 2,
+    eta_min: float = 1e-5,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
+    """Convenience: AdamW + lineer warmup + cosine annealing birlikte."""
+    opt = create_optimizer(model, lr=lr, weight_decay=weight_decay)
+    sched = create_scheduler(
+        opt, total_epochs=total_epochs,
+        warmup_epochs=warmup_epochs, eta_min=eta_min,
+    )
+    return opt, sched
+
+
 def save_checkpoint(model: torch.nn.Module, path: str | Path,
                      extras: dict | None = None) -> None:
     state = {"model": model.state_dict()}
@@ -68,8 +134,13 @@ def train_baseline(
     use_aux: bool = True,
     log_every: int = 10,
     verbose: bool = True,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> list[dict]:
-    """Sentetik veride supervised eğitim."""
+    """Sentetik veride supervised eğitim.
+
+    scheduler verilirse her epoch sonunda .step() çağrılır ve history'ye
+    `lr` alanı eklenir. Verilmezse LR sabit (geriye dönük uyumluluk).
+    """
     if lambdas is None:
         lambdas = DEFAULT_LAMBDAS
 
@@ -109,13 +180,21 @@ def train_baseline(
         epoch_avg = {k: float(np.mean(v)) for k, v in epoch_losses.items()}
         epoch_avg["epoch"] = epoch + 1
         epoch_avg["time_s"] = round(time.perf_counter() - t_start, 2)
+        # LR'i (epoch sonu, scheduler.step öncesi) kayda al
+        epoch_avg["lr"] = float(optimizer.param_groups[0]["lr"])
         history.append(epoch_avg)
+
+        # Multi-domain için tek scheduler (warmup + cosine) — restart yok
+        if scheduler is not None:
+            scheduler.step()
+
         if verbose:
             print(f"[ep {epoch+1}] L_total={epoch_avg['total']:.4f}  "
                   f"det={epoch_avg.get('detection', 0):.3f}  "
                   f"rec={epoch_avg.get('recognition', 0):.3f}  "
                   f"id={epoch_avg.get('identification', 0):.3f}  "
                   f"tsdf={epoch_avg.get('tsdf', 0):.3f}  "
+                  f"lr={epoch_avg['lr']:.2e}  "
                   f"({epoch_avg['time_s']}s)")
     return history
 
@@ -136,11 +215,15 @@ def train_dann_phase(
     lambdas: dict | None = None,
     use_aux: bool = True,
     verbose: bool = True,
+    scheduler_main: torch.optim.lr_scheduler.LRScheduler | None = None,
+    scheduler_disc: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> list[dict]:
     """DANN ile (sentetik + simulated_real_domain_id) eğitim.
 
     Domain labels MultiDomainDataset'ten geliyor (5 preset = 5 domain).
     Burada binary için: classroom = 0, diğerleri = 1 (simulated 'real').
+
+    scheduler_main / scheduler_disc verilirse her epoch sonunda .step().
     """
     history = []
     model.train()
@@ -186,10 +269,19 @@ def train_dann_phase(
 
         epoch_avg = {k: float(np.mean(v)) for k, v in epoch_losses.items()}
         epoch_avg["epoch"] = epoch + 1
+        epoch_avg["lr_main"] = float(optimizer_main.param_groups[0]["lr"])
+        epoch_avg["lr_disc"] = float(optimizer_disc.param_groups[0]["lr"])
         history.append(epoch_avg)
+
+        if scheduler_main is not None:
+            scheduler_main.step()
+        if scheduler_disc is not None:
+            scheduler_disc.step()
+
         if verbose:
             print(f"[DANN ep {epoch+1}] L_total={epoch_avg['total']:.3f}  "
-                  f"L_dom={epoch_avg['domain']:.3f}  λ={epoch_avg['grl_lambda']:.3f}")
+                  f"L_dom={epoch_avg['domain']:.3f}  λ={epoch_avg['grl_lambda']:.3f}  "
+                  f"lr_main={epoch_avg['lr_main']:.2e}")
     return history
 
 
@@ -210,6 +302,11 @@ def main():
     p.add_argument("--checkpoint_out", required=True)
     p.add_argument("--device", default="cpu")
     p.add_argument("--no_aux", action="store_true")
+    # LR scheduler (multi-domain için tek warmup + cosine)
+    p.add_argument("--warmup_epochs", type=int, default=2,
+                   help="Lineer warmup epoch sayısı (0 = scheduler kapalı)")
+    p.add_argument("--eta_min", type=float, default=1e-5,
+                   help="Cosine annealing'in ulaşacağı min lr")
     args = p.parse_args()
 
     print(f"[train] phase={args.phase} epochs={args.epochs} "
@@ -233,22 +330,47 @@ def main():
         load_checkpoint(model, args.checkpoint_in)
         print(f"[train] checkpoint yüklendi: {args.checkpoint_in}")
 
+    use_sched = args.warmup_epochs > 0 and args.epochs > args.warmup_epochs
+
     if args.phase == "baseline":
-        opt = create_optimizer(model, lr=args.lr)
+        if use_sched:
+            opt, sched = create_optimizer_and_scheduler(
+                model, total_epochs=args.epochs, lr=args.lr,
+                warmup_epochs=args.warmup_epochs, eta_min=args.eta_min,
+            )
+            print(f"[train] LR scheduler: warmup {args.warmup_epochs} ep + cosine "
+                  f"({args.lr:.0e} → {args.eta_min:.0e}) tek geçişli, multi-domain")
+        else:
+            opt, sched = create_optimizer(model, lr=args.lr), None
         train_baseline(model, loader, args.epochs, opt,
-                        device=args.device, use_aux=not args.no_aux)
+                        device=args.device, use_aux=not args.no_aux,
+                        scheduler=sched)
 
     elif args.phase == "dann":
         disc = DomainDiscriminator(in_dim=128).to(args.device)
         dann = DANNWrapper(discriminator=disc, max_lambda=0.7, alpha=5.0)
-        opt_main = create_optimizer(model, lr=args.lr)
-        opt_disc = create_optimizer(disc, lr=args.lr)
+        if use_sched:
+            opt_main, sched_main = create_optimizer_and_scheduler(
+                model, total_epochs=args.epochs, lr=args.lr,
+                warmup_epochs=args.warmup_epochs, eta_min=args.eta_min,
+            )
+            opt_disc, sched_disc = create_optimizer_and_scheduler(
+                disc, total_epochs=args.epochs, lr=args.lr,
+                warmup_epochs=args.warmup_epochs, eta_min=args.eta_min,
+            )
+            print(f"[train] DANN LR scheduler: warmup {args.warmup_epochs} ep + cosine, "
+                  f"main+disc ayrı (aynı profil)")
+        else:
+            opt_main = create_optimizer(model, lr=args.lr)
+            opt_disc = create_optimizer(disc, lr=args.lr)
+            sched_main = sched_disc = None
         train_dann_phase(
             model, disc, dann, loader,
             epochs=args.epochs,
             optimizer_main=opt_main, optimizer_disc=opt_disc,
             total_epochs=args.epochs,
             device=args.device, use_aux=not args.no_aux,
+            scheduler_main=sched_main, scheduler_disc=sched_disc,
         )
 
     elif args.phase == "distill":

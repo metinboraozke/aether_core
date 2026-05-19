@@ -27,6 +27,34 @@ YORUM (önemli):
     çalışılacak (yüksek epoch + tüm presetler, jüri sayısal tablosu için)
 
 
+EK 2026-05-19 — LR SCHEDULER (warmup + cosine) eklendi:
+  + training/train.py::create_scheduler(opt, total_epochs, warmup_epochs=2,
+                                          eta_min=1e-5)
+    LinearLR (warmup) + CosineAnnealingLR → SequentialLR (chained)
+  + training/train.py::create_optimizer_and_scheduler — convenience wrapper
+  + train_baseline / train_dann_phase: scheduler=None opsiyonel (geriye uyumlu)
+    Verilirse epoch sonunda .step() + history.lr/lr_main/lr_disc kaydı
+  + run_single_ablation: 5 varyantın hepsine AYNI scheduler uygulanır
+    (warmup_epochs=2, eta_min=1e-5 default) → adil karşılaştırma
+  + CLI: --warmup_epochs / --eta_min argümanları (0 = scheduler kapalı fallback)
+  + configs/training.yaml: lr_scheduler bloğu (type, warmup_epochs, eta_min)
+
+  Mantık: Multi-domain için TEK scheduler — domain shift "anı" yok (interleaved
+  shuffle batching), her batch karışık preset+variant. Restart yapmak öğrenilmiş
+  weight'leri sallar + DANN'ın domain-invariant feature öğrenmesini bozar.
+
+  Profil (production: epochs=40, warmup=2):
+    ep 0-2: lr 1e-5 → 1e-3 (lineer warmup)
+    ep 2-40: lr 1e-3 → 1e-5 (cosine annealing)
+
+  Birim test (4 epoch × 500 sample CPU):
+    ep 1: lr=1.00e-05 L=3.09  (warmup başı)
+    ep 2: lr=1.00e-03 L=2.61  (peak — büyük düşüş burada)
+    ep 3: lr=7.53e-04 L=2.54  (cosine başı)
+    ep 4: lr=2.58e-04 L=2.53  (cosine inişi)
+  Loss profili scheduler aktivasyonuyla beklendiği gibi.
+
+
 HEDEF
   Multi-domain dataset üzerinden FusedCSIUWBNet eğitimi + ablation çalışmaları
   (path_aux on/off, DANN on/off, oracle_kd on/off, sliding window window_size).

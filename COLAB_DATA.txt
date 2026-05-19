@@ -1,0 +1,388 @@
+################################################################################
+# AETHER CORE — PRODUCTION VERİ ÜRETİMİ (COLAB HÜCRELERİ)
+################################################################################
+# Bu dosya YALNIZCA production veri üretim hücrelerini içerir.
+# Test/sanity/görsel hücreler için → COLAB_RUN.txt
+#
+# HEDEF:
+#   5 preset × 50000 sample = 250000 toplam paired (UWB+WiFi) sample
+#   Her preset içinde 5 layout variant × 10000 sample
+#     v0: ilk 10k sample (base layout)
+#     v1: sonraki 10k sample (jittered, deterministic seed+1000)
+#     v2: sonraki 10k sample (jittered, seed+2000)
+#     v3: sonraki 10k sample (jittered, seed+3000)
+#     v4: son 10k sample (jittered, seed+4000)
+#   → Model "spesifik anchor koordinatı" değil "RF geometri prensipleri" öğrenir
+#
+# ZAMAN TAHMİNİ (Colab L4 / A100 GPU):
+#   1k sample ≈ 6 dk (UWB) + 1 dk (WiFi batched) = 7 dk
+#   50k sample × 7 dk/1k = ~6 saat / preset
+#   5 preset × 6 saat = ~30 saat TOPLAM
+#   → MULTI-SESSION ŞART (Colab session 12 saat max)
+#   → Her preset ayrı session'da koşturulabilir; checkpoint_every 1000
+#     ile session kopsa bile son 1k güvende.
+#
+# ÇIKTI (her preset için, drive'da ayrı klasör):
+#   /MyDrive/aether_core/data/<preset>/
+#       ├── uwb_cir_oracle.npy          [50000, 6, 32, 2]
+#       ├── uwb_cir_anchor.npy          [50000, 6, 32, 2]
+#       ├── path_params_oracle.npy      [50000, 6, 20, 4]
+#       ├── path_params_anchor.npy      [50000, 6, 20, 4]
+#       ├── slot_labels.npy             [50000, 6]
+#       ├── material_labels.npy         [50000, 6]
+#       ├── codeword_labels.npy         [50000, 6, 7]
+#       ├── data_id_labels.npy          [50000, 6]
+#       ├── csivec_delta.npy            [50000, 28, 108, 2]
+#       ├── path_params_csi.npy         [50000, 28, 20, 4]
+#       ├── slot_labels_wifi.npy        [50000, 6]   (UWB ile birebir aynı)
+#       ├── material_labels_wifi.npy    [50000, 6]
+#       ├── layout_ids.npy              [50000]      (FAZ 0.5: 0,0,..,0,1,1,..,4,4)
+#       ├── layout_ids_wifi.npy         [50000]      (UWB ile birebir aynı)
+#       └── layout_meta.yaml            (her 5 variant için 8 node konum referansı)
+#
+# KULLANIM:
+#   1. Drive'a PROJESON'u senkronize et (en güncel kod, ca9fb88+).
+#   2. Colab > New Notebook > Runtime > GPU (L4 / A100 öneri).
+#   3. HÜCRE 1-3 setup'ı bir kez çalıştır.
+#   4. HÜCRE 4 parametre kontrolü.
+#   5. HÜCRE 5-9 her preset için ayrı çalıştır (gerekirse ayrı sessionlarda).
+#   6. HÜCRE 10 toplam sağlık kontrolü (üretim bitince).
+################################################################################
+
+
+
+# ============================================================================
+# HÜCRE 1 — DRIVE MOUNT + PROJE YOLU
+# ============================================================================
+# Süre: ~10-30 saniye (auth dahil).
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, sys
+
+PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+OUTPUT_BASE  = '/content/drive/MyDrive/aether_core/data'
+
+sys.path.insert(0, PROJECT_ROOT)
+os.makedirs(OUTPUT_BASE, exist_ok=True)
+os.chdir(PROJECT_ROOT)
+
+print('Working dir :', os.getcwd())
+print('Output dir  :', OUTPUT_BASE)
+print('Sağlık kontrolü:')
+for d in ['configs', 'data_synthesis', 'scenes']:
+    print(f'  {d:25s} {"OK" if os.path.isdir(d) else "EKSİK !!"}')
+for f in ['data_synthesis/generate_hybrid_sionna.py',
+          'data_synthesis/generate_wifi_csi_sionna.py',
+          'data_synthesis/layout_variants.py']:
+    print(f'  {f:50s} {"OK" if os.path.isfile(f) else "EKSİK !!"}')
+
+
+
+# ============================================================================
+# HÜCRE 2 — GPU + SIONNA KURULUM
+# ============================================================================
+# Süre: ~2-4 dakika (ilk kurulum). Sonraki session'larda cache'lenir.
+
+!nvidia-smi | head -20
+
+!pip install -q sionna mitsuba pyyaml tqdm
+
+import sionna, mitsuba as mi
+print(f'sionna  : {sionna.__version__}')
+print(f'mitsuba : {mi.__version__}')
+
+mi.set_variant('cuda_ad_rgb')
+print(f'mitsuba variant: {mi.variant()}')
+
+# variant set fail ederse 'llvm_ad_rgb' veya 'scalar_rgb' dene (CPU mode, çok daha yavaş)
+
+
+
+# ============================================================================
+# HÜCRE 3 — PRODUCTION PARAMETRELERİ
+# ============================================================================
+# Burada DEĞİŞTİR: sample sayısı, variant sayısı, jitter genliği.
+# Üretim başladıktan sonra DEĞİŞTİRME (paired dataset tutarlılığı için).
+
+PER_PRESET       = 50000   # her preset için toplam sample (production)
+N_VARIANTS       = 5       # preset başına farklı yerleşim sayısı
+                           # PER_PRESET / N_VARIANTS = 10000 sample/variant
+LAYOUT_JITTER_XY = 0.3     # metre, XY gaussian std (~30 cm)
+LAYOUT_JITTER_Z  = 0.1     # metre, Z gaussian std (~10 cm)
+CHECKPOINT_EVERY = 1000    # her 1000 sample'da diske kaydet
+                           # (session kopsa bile son 1k güvende)
+
+# Tahmini süre per preset:
+#   PER_PRESET * 7 dk/1000 = 50000 * 7/1000 = 350 dk ≈ 5.8 saat
+# Toplam: 5 preset × 5.8 saat ≈ 29 saat → MULTI-SESSION ŞART
+
+PRESETS = [
+    {"name": "classroom_default",  "scene": "scenes/aether_classroom.xml",
+     "config": "configs/scene.yaml",                  "seed": 42},
+    {"name": "warehouse_large",    "scene": "scenes/aether_warehouse_large.xml",
+     "config": "configs/scene_warehouse_large.yaml",  "seed": 142},
+    {"name": "office_small",       "scene": "scenes/aether_office_small.xml",
+     "config": "configs/scene_office_small.yaml",     "seed": 242},
+    {"name": "lab_medium",         "scene": "scenes/aether_lab_medium.xml",
+     "config": "configs/scene_lab_medium.yaml",       "seed": 342},
+    {"name": "room_low_ceiling",   "scene": "scenes/aether_room_low_ceiling.xml",
+     "config": "configs/scene_room_low_ceiling.yaml", "seed": 442},
+]
+
+for p in PRESETS:
+    p['out'] = os.path.join(OUTPUT_BASE, p['name'])
+    os.makedirs(p['out'], exist_ok=True)
+
+print(f'PRODUCTION VERİ ÜRETİM PLANI')
+print(f'  PER_PRESET       : {PER_PRESET:,}')
+print(f'  N_VARIANTS       : {N_VARIANTS}  → {PER_PRESET//N_VARIANTS:,} sample/variant')
+print(f'  LAYOUT_JITTER_XY : {LAYOUT_JITTER_XY} m (XY)')
+print(f'  LAYOUT_JITTER_Z  : {LAYOUT_JITTER_Z} m (Z)')
+print(f'  Toplam veri      : {len(PRESETS) * PER_PRESET:,} sample')
+print(f'  Tahmini süre     : ~{len(PRESETS) * PER_PRESET * 7 / 1000 / 60:.1f} saat')
+print(f'\n5 PRESET ÇIKTI YOLU:')
+for p in PRESETS:
+    print(f'  {p["name"]:25s} → {p["out"]}')
+
+
+
+# ============================================================================
+# HÜCRE 4 — TEK PRESET ÜRETİM FONKSİYONU (yardımcı, çağrılır)
+# ============================================================================
+# Bu hücre fonksiyon TANIMLAR; doğrudan veri üretmez.
+# HÜCRE 5-9 bu fonksiyonu çağırır.
+
+import subprocess, time, numpy as np
+
+def produce_preset(preset, per_preset=PER_PRESET, n_variants=N_VARIANTS,
+                    jitter_xy=LAYOUT_JITTER_XY, jitter_z=LAYOUT_JITTER_Z,
+                    checkpoint_every=CHECKPOINT_EVERY):
+    """Tek bir preset için UWB + WiFi üretim + paired/layout check.
+
+    Üretim ÇIKTI dosyaları zaten varsa otomatik skip ETMEZ — yeniden üretir.
+    Tekrar üretmek istemiyorsan bu hücreyi atla.
+    """
+    print(f'\n{"="*70}')
+    print(f'PRESET ÜRETİM BAŞLIYOR: {preset["name"]}')
+    print(f'{"="*70}')
+    print(f'  Out      : {preset["out"]}')
+    print(f'  Config   : {preset["config"]}')
+    print(f'  Scene    : {preset["scene"]}')
+    print(f'  Seed     : {preset["seed"]}')
+    print(f'  Sample   : {per_preset:,} ({n_variants} variant × {per_preset//n_variants:,} sample)')
+
+    # --- UWB pass ---
+    t0 = time.perf_counter()
+    print(f'\n[1/2] UWB üretim (hybrid TDMA round-robin)...')
+    !python -m data_synthesis.generate_hybrid_sionna \
+        --n {per_preset} \
+        --out {preset['out']} \
+        --scene {preset['scene']} \
+        --config {preset['config']} \
+        --checkpoint_every {checkpoint_every} \
+        --n_variants {n_variants} \
+        --layout_jitter_xy {jitter_xy} \
+        --layout_jitter_z {jitter_z} \
+        --seed {preset['seed']}
+    t_uwb = time.perf_counter() - t0
+    print(f'[UWB] tamamlandı: {t_uwb/60:.1f} dk')
+
+    # --- WiFi pass ---
+    t1 = time.perf_counter()
+    print(f'\n[2/2] WiFi CSI üretim (8 ESP32 batched)...')
+    !python -m data_synthesis.generate_wifi_csi_sionna \
+        --n {per_preset} \
+        --out {preset['out']} \
+        --scene {preset['scene']} \
+        --config {preset['config']} \
+        --checkpoint_every {checkpoint_every} \
+        --n_variants {n_variants} \
+        --layout_jitter_xy {jitter_xy} \
+        --layout_jitter_z {jitter_z} \
+        --seed {preset['seed']}
+    t_wifi = time.perf_counter() - t1
+    print(f'[WiFi] tamamlandı: {t_wifi/60:.1f} dk')
+
+    # --- Sanity check ---
+    print(f'\n[CHECK] {preset["name"]} sağlık kontrolü...')
+    uwb_slot     = np.load(os.path.join(preset['out'], 'slot_labels.npy'))
+    wifi_slot    = np.load(os.path.join(preset['out'], 'slot_labels_wifi.npy'))
+    uwb_layout   = np.load(os.path.join(preset['out'], 'layout_ids.npy'))
+    wifi_layout  = np.load(os.path.join(preset['out'], 'layout_ids_wifi.npy'))
+
+    paired_ok = np.array_equal(uwb_slot, wifi_slot)
+    layout_ok = np.array_equal(uwb_layout, wifi_layout)
+    variant_dist = np.bincount(uwb_layout, minlength=n_variants).tolist()
+    expected_per_var = per_preset // n_variants
+
+    print(f'  slot_labels shape       : {uwb_slot.shape}')
+    print(f'  slot paired (UWB=WiFi)  : {paired_ok}  {"OK" if paired_ok else "HATALI !!"}')
+    print(f'  layout paired           : {layout_ok}  {"OK" if layout_ok else "HATALI !!"}')
+    print(f'  variant dağılımı        : {variant_dist}')
+    print(f'  beklenen / variant      : {expected_per_var:,}')
+    print(f'  dağılım dengeli mi      : {all(abs(c - expected_per_var) <= per_preset % n_variants for c in variant_dist)}')
+
+    total_min = (t_uwb + t_wifi) / 60
+    print(f'\n[{preset["name"]}] BİTTİ — toplam {total_min:.1f} dk')
+    return {
+        'name': preset['name'],
+        'time_min': total_min,
+        'paired_ok': paired_ok,
+        'layout_ok': layout_ok,
+        'variant_dist': variant_dist,
+    }
+
+
+print('produce_preset() fonksiyonu hazır.')
+print('Sıradaki hücreleri (5-9) tek tek çalıştır.')
+print('Multi-session: her preset ayrı session\'da koşturulabilir.')
+
+
+
+# ============================================================================
+# HÜCRE 5 — PRESET 1/5: classroom_default — 50k sample × 5 variant
+# ============================================================================
+# Süre: ~5-6 saat L4 GPU. Multi-session: ayrı çalıştırılabilir.
+# Variant dağılımı: 10000 × 5 = 50000
+
+result_classroom = produce_preset(PRESETS[0])
+print(f'\n>>> classroom_default sonuç: {result_classroom}')
+
+
+
+# ============================================================================
+# HÜCRE 6 — PRESET 2/5: warehouse_large — 50k sample × 5 variant
+# ============================================================================
+# Süre: ~6-7 saat L4 GPU (büyük oda → daha fazla multi-bounce path).
+
+result_warehouse = produce_preset(PRESETS[1])
+print(f'\n>>> warehouse_large sonuç: {result_warehouse}')
+
+
+
+# ============================================================================
+# HÜCRE 7 — PRESET 3/5: office_small — 50k sample × 5 variant
+# ============================================================================
+# Süre: ~4-5 saat L4 GPU (küçük oda → daha az path).
+
+result_office = produce_preset(PRESETS[2])
+print(f'\n>>> office_small sonuç: {result_office}')
+
+
+
+# ============================================================================
+# HÜCRE 8 — PRESET 4/5: lab_medium — 50k sample × 5 variant
+# ============================================================================
+# Süre: ~5-6 saat L4 GPU.
+
+result_lab = produce_preset(PRESETS[3])
+print(f'\n>>> lab_medium sonuç: {result_lab}')
+
+
+
+# ============================================================================
+# HÜCRE 9 — PRESET 5/5: room_low_ceiling — 50k sample × 5 variant
+# ============================================================================
+# Süre: ~5-6 saat L4 GPU (alçak tavan → yansıma sayısı yüksek).
+
+result_room = produce_preset(PRESETS[4])
+print(f'\n>>> room_low_ceiling sonuç: {result_room}')
+
+
+
+# ============================================================================
+# HÜCRE 10 — TOPLAM SAĞLIK KONTROLÜ + ÖZET TABLO
+# ============================================================================
+# 5 preset üretimi bittikten sonra çalıştır.
+
+import numpy as np, os
+
+print(f'{"="*78}')
+print(f'AETHER CORE — PRODUCTION VERİ ÖZET (250k SAMPLE)')
+print(f'{"="*78}')
+print(f'{"PRESET":25s} {"N":>8s} {"PAIRED":>8s} {"LAYOUT":>8s} {"VARIANT DAĞILIMI":>20s} {"DISK_MB":>10s}')
+print(f'{"-"*78}')
+
+grand_total = 0
+all_ok = True
+for p in PRESETS:
+    out = p['out']
+    try:
+        slot     = np.load(os.path.join(out, 'slot_labels.npy'))
+        slot_wf  = np.load(os.path.join(out, 'slot_labels_wifi.npy'))
+        layout   = np.load(os.path.join(out, 'layout_ids.npy'))
+        layout_wf= np.load(os.path.join(out, 'layout_ids_wifi.npy'))
+
+        paired_ok = '✓' if np.array_equal(slot, slot_wf) else '✗'
+        layout_ok = '✓' if np.array_equal(layout, layout_wf) else '✗'
+        dist = np.bincount(layout).tolist()
+
+        # Disk boyutu
+        size_mb = sum(
+            os.path.getsize(os.path.join(out, f))
+            for f in os.listdir(out) if f.endswith(('.npy', '.yaml'))
+        ) / 1024 / 1024
+
+        grand_total += slot.shape[0]
+        if paired_ok != '✓' or layout_ok != '✓':
+            all_ok = False
+
+        print(f'{p["name"]:25s} {slot.shape[0]:>8,d} {paired_ok:>8s} {layout_ok:>8s} '
+              f'{str(dist):>20s} {size_mb:>9.1f}M')
+    except FileNotFoundError as e:
+        print(f'{p["name"]:25s}  HATA: {e.filename} yok (üretilmemiş olabilir)')
+        all_ok = False
+
+print(f'{"-"*78}')
+print(f'{"TOPLAM":25s} {grand_total:>8,d} sample')
+print(f'\nTUM SAGLIK : {"BAŞARILI ✓" if all_ok else "EKSİK / HATALI ✗"}')
+
+if all_ok:
+    print(f'\nProduction veri hazır. Sonraki adımlar:')
+    print(f'  1. Drive\'dan lokale çek (toplam ~10 GB):')
+    print(f'     rsync -av /content/drive/MyDrive/aether_core/data/ ./data/')
+    print(f'  2. MultiDomainDataset ile yükle ve ablation:')
+    print(f'     python -m training.ablation --epochs 40 --batch_size 64 \\')
+    print(f'                                 --warmup_epochs 2 --eta_min 1e-5 \\')
+    print(f'                                 --device cuda')
+    print(f'  3. Beklenen süre (5 varyant × 40 ep × 250k sample):')
+    print(f'     ~30-45 dk/varyant L4 GPU = ~3-4 saat toplam ablation')
+
+
+
+# ============================================================================
+# HÜCRE 11 (OPSİYONEL) — TEK PRESET'İ YENİDEN ÜRET
+# ============================================================================
+# Eğer bir preset bozuk üretildiyse (paired/layout check fail), önce eski
+# dosyaları sil, sonra produce_preset() tek satırla yeniden çağır.
+
+# import shutil
+# preset_to_redo = PRESETS[1]   # warehouse_large
+# shutil.rmtree(preset_to_redo['out'])
+# os.makedirs(preset_to_redo['out'], exist_ok=True)
+# result = produce_preset(preset_to_redo)
+# print(result)
+
+
+
+# ============================================================================
+# HÜCRE 12 (OPSİYONEL) — KESİNTİDEN SONRA DEVAM (CHECKPOINT'TEN)
+# ============================================================================
+# Session koparsa: checkpoint_every=1000 sayesinde son 1k güvende.
+# Eski parça dosyalar (cir_anchor_*.npy, vs) /MyDrive/aether_core/data/<preset>/
+# içinde durur. Tekrar çalıştırıldığında script bu parçaları YEMEZ — üzerine
+# yeni indeksten başlar. Aşağıdaki kontrol ile mevcut durumu gör:
+
+# preset = PRESETS[0]
+# import glob
+# chunks = sorted(glob.glob(os.path.join(preset['out'], 'cir_anchor_*.npy')))
+# print(f'{preset["name"]}: {len(chunks)} chunk var (son chunk: {chunks[-1] if chunks else "yok"})')
+# # Eğer üretim bittiyse merge edilmiş final dosya var:
+# final = os.path.join(preset['out'], 'uwb_cir_anchor.npy')
+# print(f'  final: {"VAR" if os.path.exists(final) else "YOK (üretim devam ediyor)"}')
+
+################################################################################
+# SON — bu noktadan sonra eğitim aşamasına geç (training/ablation.py).
+################################################################################

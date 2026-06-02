@@ -152,9 +152,18 @@ def train_baseline(
         lambdas = DEFAULT_LAMBDAS
 
     history = []
-    # P2: NaN guard için son sağlam state cache
-    last_safe_state: dict | None = None
     nan_recovery_count = 0
+
+    # P2 fix (2026-06-03): chunk'lar arası persist sorununu çöz
+    # train_baseline her chunk'ta yeniden çağrıldığı için (run_single_ablation
+    # val_interval loop'u) local last_safe_state = None reset oluyordu →
+    # NaN recovery "sağlam state yok" diye eski state'e dönemiyordu.
+    # ÇÖZÜM: Fonksiyon başında model state'i AUTO-SNAPSHOT al.
+    # Chunk başında model garantili sağlam (önceki chunk val sonrası kaydedilmiş)
+    # veya freshly initialized → snapshot güvenli fallback olur.
+    last_safe_state: dict = {
+        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+    }
 
     model.train()
     for epoch in range(epochs):
@@ -204,25 +213,23 @@ def train_baseline(
             nan_recovery_count += 1
             print(f"[NAN-GUARD] ep {epoch+1} loss={epoch_avg['total']} → "
                   f"recovery (#{nan_recovery_count})")
-            if last_safe_state is not None:
-                # 1) Model'i son sağlam state'e geri yükle
-                # Cache CPU'da → orijinal device'a tekrar gönder
-                target_device = next(model.parameters()).device
-                model.load_state_dict({
-                    k: v.to(target_device) for k, v in last_safe_state.items()
-                })
-                # 2) Optimizer state'i IN-PLACE temizle (PyTorch sürüm uyumlu)
-                #    optimizer.state container type'ını koru, sadece içini boşalt
-                #    type(optimizer.state)() PyTorch 2.x'te yanlış container üretiyor
-                #    → AdamW.step() KeyError fırlatıyor. clear() güvenli.
-                optimizer.state.clear()
-                # 3) Lr'i geçici olarak yarıya düşür (bir sonraki adım daha temkinli)
-                for g in optimizer.param_groups:
-                    g["lr"] = g["lr"] * 0.5
-                print(f"[NAN-GUARD] son sağlam state yüklendi, "
-                      f"optimizer.state.clear() + lr×0.5 = {optimizer.param_groups[0]['lr']:.2e}")
-            else:
-                print(f"[NAN-GUARD] sağlam state yok, epoch atlanıyor (cache henüz dolmadı)")
+            # last_safe_state fonksiyon başında zaten dolduruldu (auto-snapshot)
+            # → her durumda recovery yapılabilir
+            # 1) Model'i son sağlam state'e geri yükle (CPU → device)
+            target_device = next(model.parameters()).device
+            model.load_state_dict({
+                k: v.to(target_device) for k, v in last_safe_state.items()
+            })
+            # 2) Optimizer state'i IN-PLACE temizle (PyTorch sürüm uyumlu)
+            #    optimizer.state container type'ını koru, sadece içini boşalt.
+            #    type(optimizer.state)() PyTorch 2.x'te yanlış container üretiyor
+            #    → AdamW.step() KeyError fırlatıyor. clear() güvenli.
+            optimizer.state.clear()
+            # 3) Lr'i geçici olarak yarıya düşür (bir sonraki adım daha temkinli)
+            for g in optimizer.param_groups:
+                g["lr"] = g["lr"] * 0.5
+            print(f"[NAN-GUARD] sağlam state yüklendi, "
+                  f"optimizer.state.clear() + lr×0.5 = {optimizer.param_groups[0]['lr']:.2e}")
             # NaN epoch'u history'ye yine de kaydet (debug için)
             epoch_avg["nan_recovery"] = True
             history.append(epoch_avg)
@@ -238,6 +245,9 @@ def train_baseline(
             nan_recovery_count = 0
 
         # Loss sağlamsa state'i cache'le (CPU clone — bellek dostu)
+        # Bu cache aynı zamanda sonraki chunk'a "fallback safe state" olarak
+        # geçer (chunk başında run_single_ablation modeli son sağlam state'te
+        # bırakır; train_baseline auto-snapshot ile bunu cache'ler).
         last_safe_state = {
             k: v.detach().cpu().clone() for k, v in model.state_dict().items()
         }

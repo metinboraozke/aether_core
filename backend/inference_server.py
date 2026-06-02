@@ -35,6 +35,7 @@ except ImportError:
     torch = None
 
 from backend.sync_buffer import MultiSensorSyncBuffer
+from backend.product_db import ProductDB
 from preprocessing import (
     AdaptiveBaseline, preprocess_csi, preprocess_uwb,
 )
@@ -81,12 +82,23 @@ class InferenceEngine:
         ring_capacity: int = 200,
         baseline_cfg: dict | None = None,
         device: str = "cpu",
+        product_db_path: str = "configs/resonator_db.yaml",
     ):
         self.model = model
         self.tracker_model = tracker_model
         self.device = device
         self.master_tick_ms = int(master_tick_ms)
         self.master_tick_s = master_tick_ms / 1000.0
+
+        # C Paketi (2026-06-03): Spektral barkod ürün DB
+        # codeword → ID → ürün lookup (recognition bypass + çift doğrulama)
+        try:
+            self.product_db = ProductDB(product_db_path)
+            print(f"[InferenceEngine] ProductDB yüklendi: "
+                  f"{len(self.product_db.all())} ürün ({product_db_path})")
+        except FileNotFoundError as e:
+            print(f"[InferenceEngine] ProductDB UYARI: {e} → products field boş")
+            self.product_db = None
 
         # Sync buffer (28 WiFi + 6 UWB bistatic)
         self.sync_buffer = MultiSensorSyncBuffer(
@@ -223,11 +235,25 @@ class InferenceEngine:
         det_mask = np.array(model_out["detection_mask"], dtype=np.uint8)
         self.last_detection_mask = det_mask.flatten()[:6]
 
-        # 6) Output paketi
+        # 6) C Paketi (2026-06-03): DB lookup → products field
+        products = []
+        if self.product_db is not None and "codeword_logits_raw" in model_out:
+            try:
+                products = self.product_db.build_packet_products(
+                    detection_mask=det_mask,
+                    codeword_logits=model_out["codeword_logits_raw"],
+                    material_logits=model_out.get("material_logits_raw"),
+                )
+            except Exception as e:
+                print(f"[InferenceEngine] ProductDB build hatası: {e}")
+                products = []
+
+        # 7) Output paketi
         packet = {
             "t_master_ns": frame["t_master_ns"],
             "detection_mask": model_out["detection_mask"],
-            "materials": model_out["materials"],
+            "materials": model_out["materials"],          # MODEL OUTPUT (çift doğrulama)
+            "products": products,                          # YENİ — DB lookup sonuçları
             "barcode_sparse": model_out["barcode_sparse"],
             "uncertainty": model_out["uncertainty"],
             "tracking": track,
@@ -243,29 +269,53 @@ class InferenceEngine:
     # ── Mock + tensor helpers ──────────────────────────────
 
     def _mock_model_output(self) -> dict[str, Any]:
-        """Random output (mock mode, model yok)."""
+        """Random output (mock mode, model yok).
+
+        C Paketi: codeword_logits + material_logits_raw da üretilir (DB lookup için).
+        """
         rng = np.random.default_rng()
+        det = rng.integers(0, 2, size=6)
+        # Mock için 16 ürün ID'lerinden rastgele seç + Hamming encode → 7-bit binary
+        # (deterministik olsun ki DB lookup mantıklı bir ID döndürsün)
+        from data_synthesis.resonator_inject import hamming_encode_7_4, int_to_data_bits
+        ids = rng.integers(0, 16, size=6, dtype=np.uint8)
+        cw = hamming_encode_7_4(int_to_data_bits(ids))   # (6, 7) binary
+        # Mock material logits: doğru materyal hafif puan üstün (DB ile %50 uyum)
+        mat_logits = rng.standard_normal((6, 4))
         return {
-            "detection_mask": rng.integers(0, 2, size=6).tolist(),
+            "detection_mask": det.tolist(),
             "materials": rng.integers(0, 4, size=6).tolist(),
             "barcode_sparse": rng.standard_normal(64).tolist(),
             "uncertainty": rng.uniform(0.01, 0.5, size=(6, 8, 8, 8)).tolist(),
+            # C Paketi: raw arrays product DB için
+            "codeword_logits_raw": cw.astype(np.float32) * 5.0 - 2.5,  # binary → logit
+            "material_logits_raw": mat_logits.astype(np.float32),
         }
 
     def _tensorize_out(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """FusedCSIUWBNet çıktısı → JSON-serializable."""
+        """FusedCSIUWBNet çıktısı → JSON-serializable.
+
+        C Paketi: ham codeword_logits + material_logits arrays döner
+        (DB lookup için, packet builder dışında kullanılır).
+        """
         import torch as _torch
         det_mask = raw["detection_mask"][0].cpu().numpy().astype(int).tolist()
-        materials = raw["material_logits"][0].argmax(-1).cpu().numpy().tolist()
+        material_logits_t = raw["material_logits"][0]                     # (6, 4)
+        materials = material_logits_t.argmax(-1).cpu().numpy().tolist()
         # Identification: 64-d latent (cosine için DB lookup ileride)
         barcode = raw["barcode_latent"][0].mean(dim=0).cpu().numpy().tolist()
         # Uncertainty: σ² voxel
         uncertainty = raw["tsdf_sigma2"][0].cpu().numpy().tolist()
+        # C Paketi: ham logit arrays (product DB lookup için)
+        cw_logits = raw["barcode_codeword"][0].cpu().numpy()              # (6, 7)
+        mat_logits = material_logits_t.cpu().numpy()                      # (6, 4)
         return {
             "detection_mask": det_mask,
             "materials": materials,
             "barcode_sparse": barcode,
             "uncertainty": uncertainty,
+            "codeword_logits_raw": cw_logits,
+            "material_logits_raw": mat_logits,
         }
 
     # ── Broadcast ──────────────────────────────────────────

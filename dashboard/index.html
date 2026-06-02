@@ -12,23 +12,82 @@
       font-family: 'Consolas', 'Monaco', monospace;
       overflow: hidden;
     }
-    #app { position: fixed; inset: 0; }
+
+    /* ── C Paketi (2026-06-03): Layout grid (sidebar + content) ── */
+    #layout {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      height: 100vh;
+    }
+    #sidebar {
+      background: #131313;
+      border-right: 1px solid #2a2a2a;
+      padding: 18px 12px;
+      box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    #sidebar h1 {
+      font-size: 16px; margin: 0 0 18px 0;
+      color: #4caf50; letter-spacing: 1px;
+    }
+    #sidebar h1 small {
+      display: block; color: #666; font-size: 10px;
+      margin-top: 4px; letter-spacing: 0;
+    }
+    .nav-btn {
+      background: #1c1c1c; color: #ccc;
+      border: 1px solid #2a2a2a; border-radius: 4px;
+      padding: 10px 12px; cursor: pointer;
+      font-family: inherit; font-size: 13px;
+      text-align: left; transition: background 0.15s;
+    }
+    .nav-btn:hover { background: #262626; }
+    .nav-btn.active {
+      background: #1e3a1e; color: #4caf50; border-color: #2e5e2e;
+    }
+    #sidebar .spacer { flex: 1; }
+    #sidebar-status {
+      font-size: 11px; color: #666;
+      border-top: 1px solid #2a2a2a; padding-top: 10px;
+    }
+    #sidebar-status .dot {
+      display: inline-block; width: 8px; height: 8px;
+      border-radius: 50%; background: #f44336;
+      margin-right: 6px; vertical-align: middle;
+    }
+    #sidebar-status .dot.ok { background: #4caf50; }
+    #sidebar-status .dot.warn { background: #ff9800; }
+
+    /* ── Main content area ── */
+    #content {
+      position: relative;
+      overflow: hidden;
+    }
+    .view { display: none; height: 100%; width: 100%; }
+    .view.active { display: block; }
+
+    /* ── Live view (Three.js canvas + HUD) ── */
+    #view-live { position: relative; }
+    #app { position: absolute; inset: 0; }
     .hud {
-      position: fixed;
+      position: absolute;
       padding: 10px 14px;
       background: rgba(0, 0, 0, 0.75);
       border: 1px solid #333;
       border-radius: 4px;
       font-size: 12px;
       line-height: 1.6;
+      pointer-events: none;
     }
     #hud-top-left { top: 10px; left: 10px; }
-    #hud-top-right { top: 10px; right: 10px; min-width: 200px; }
+    #hud-top-right { top: 10px; right: 10px; min-width: 260px; max-height: 80vh; overflow-y: auto; pointer-events: auto; }
     #hud-bottom-left { bottom: 10px; left: 10px; max-width: 320px; }
     .label { color: #888; }
     .value { color: #4caf50; font-weight: bold; }
     .warn { color: #ff9800; }
     .err { color: #f44336; }
+    .ok-tick { color: #4caf50; }
+    .warn-tick { color: #ff9800; }
     .legend-row { display: flex; align-items: center; margin: 3px 0; }
     .legend-color {
       display: inline-block;
@@ -36,7 +95,87 @@
       margin-right: 8px;
       border-radius: 2px;
     }
-    h3 { margin: 0 0 6px 0; font-size: 13px; color: #4caf50; }
+    .hud h3 { margin: 0 0 6px 0; font-size: 13px; color: #4caf50; }
+    .slot-row {
+      border-bottom: 1px solid #2a2a2a;
+      padding: 5px 0;
+      font-size: 11px;
+    }
+    .slot-row:last-child { border-bottom: none; }
+    .slot-name { color: #e0e0e0; font-weight: bold; }
+    .slot-id { color: #888; font-size: 10px; }
+    .dual { font-size: 10px; color: #aaa; margin-top: 2px; }
+
+    /* ── Products view (catalog grid + history) ── */
+    #view-products {
+      padding: 24px;
+      overflow-y: auto;
+      box-sizing: border-box;
+    }
+    #view-products h2 { color: #4caf50; margin-top: 0; }
+    #view-products h3 { color: #888; margin: 24px 0 8px; font-size: 13px; }
+    #products-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 10px;
+    }
+    .product-card {
+      background: #1c1c1c;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: 12px;
+      transition: border-color 0.15s;
+    }
+    .product-card:hover { border-color: #4caf50; }
+    .product-card .id-badge {
+      display: inline-block;
+      background: #131313;
+      color: #4caf50;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      margin-right: 6px;
+    }
+    .product-card .color-swatch {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border-radius: 3px;
+      vertical-align: middle;
+      margin-right: 6px;
+      border: 1px solid #444;
+    }
+    .product-card .name {
+      font-size: 13px; color: #e0e0e0;
+      margin: 6px 0 4px;
+    }
+    .product-card .meta {
+      font-size: 11px; color: #888;
+      line-height: 1.4;
+    }
+    .product-card .read-count {
+      margin-top: 8px; padding-top: 8px;
+      border-top: 1px solid #2a2a2a;
+      font-size: 11px; color: #4caf50;
+    }
+    #readings-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 11px;
+    }
+    #readings-table th, #readings-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #2a2a2a;
+      text-align: left;
+    }
+    #readings-table th {
+      color: #4caf50; font-weight: normal;
+      background: #131313;
+      position: sticky; top: 0;
+    }
+    #readings-table .match-ok { color: #4caf50; }
+    #readings-table .match-warn { color: #ff9800; }
+    #readings-table .empty-row {
+      color: #555; font-style: italic;
+    }
   </style>
   <script type="importmap">
     {
@@ -48,32 +187,94 @@
   </script>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="layout">
+    <!-- ── SOL NAVBAR ── -->
+    <nav id="sidebar">
+      <h1>AETHER CORE
+        <small>WiFi+UWB RF Vision</small>
+      </h1>
+      <button class="nav-btn active" data-view="live">▶ Canlı Voxel</button>
+      <button class="nav-btn" data-view="products">📦 Ürün Kataloğu</button>
+      <div class="spacer"></div>
+      <div id="sidebar-status">
+        <span class="dot" id="sidebar-ws-dot"></span>
+        <span id="sidebar-ws-text">bağlanıyor...</span>
+        <div style="margin-top:6px;">
+          <span class="label">Tick:</span>
+          <span class="value" id="sidebar-tick">0</span>
+        </div>
+        <div>
+          <span class="label">Inference:</span>
+          <span class="value" id="sidebar-inf">--</span> ms
+        </div>
+      </div>
+    </nav>
 
-  <div id="hud-top-left" class="hud">
-    <h3>AETHER CORE</h3>
-    <div><span class="label">WS:</span> <span id="ws-status" class="warn">connecting...</span></div>
-    <div><span class="label">FPS:</span> <span id="fps" class="value">--</span></div>
-    <div><span class="label">Inference:</span> <span id="inference-ms" class="value">--</span> ms</div>
-    <div><span class="label">Tick:</span> <span id="tick-count" class="value">0</span></div>
-  </div>
+    <!-- ── ANA İÇERİK ── -->
+    <main id="content">
+      <!-- LIVE VIEW (mevcut Three.js + HUD) -->
+      <section id="view-live" class="view active">
+        <div id="app"></div>
 
-  <div id="hud-top-right" class="hud">
-    <h3>SLOT DURUMU</h3>
-    <div id="slot-status">--</div>
-  </div>
+        <div id="hud-top-left" class="hud">
+          <h3>STATUS</h3>
+          <div><span class="label">WS:</span> <span id="ws-status" class="warn">connecting...</span></div>
+          <div><span class="label">FPS:</span> <span id="fps" class="value">--</span></div>
+          <div><span class="label">Inference:</span> <span id="inference-ms" class="value">--</span> ms</div>
+          <div><span class="label">Tick:</span> <span id="tick-count" class="value">0</span></div>
+        </div>
 
-  <div id="hud-bottom-left" class="hud">
-    <h3>LEJANT</h3>
-    <div class="legend-row"><span class="legend-color" style="background:#c0c0c0"></span> Metal</div>
-    <div class="legend-row"><span class="legend-color" style="background:#4488ff"></span> Plastik</div>
-    <div class="legend-row"><span class="legend-color" style="background:#884422"></span> Ahşap</div>
-    <div class="legend-row"><span class="legend-color" style="background:#ddccaa"></span> Karton</div>
-    <div class="legend-row"><span class="legend-color" style="background:#666"></span> Boş</div>
-    <div style="margin-top:8px;font-size:11px;color:#888;">
-      Opacity = μ (Bayesian doluluk)<br>
-      Glow    = σ² (belirsizlik)
-    </div>
+        <div id="hud-top-right" class="hud">
+          <h3>SLOT DURUMU (çift doğrulama)</h3>
+          <div id="slot-status">--</div>
+        </div>
+
+        <div id="hud-bottom-left" class="hud">
+          <h3>LEJANT</h3>
+          <div class="legend-row"><span class="legend-color" style="background:#999999"></span> Metal</div>
+          <div class="legend-row"><span class="legend-color" style="background:#3498DB"></span> Plastik</div>
+          <div class="legend-row"><span class="legend-color" style="background:#8B4513"></span> Ahşap</div>
+          <div class="legend-row"><span class="legend-color" style="background:#F5DEB3"></span> Karton</div>
+          <div class="legend-row"><span class="legend-color" style="background:#404040"></span> Boş / Bilinmeyen</div>
+          <div style="margin-top:8px;font-size:11px;color:#888;">
+            Renk = DB lookup (ID → ürün)<br>
+            Opacity = μ (Bayesian doluluk)<br>
+            ✓ = Model & DB eşleşti<br>
+            ⚠ = Uyumsuz (DB güvenilir)
+          </div>
+        </div>
+      </section>
+
+      <!-- PRODUCTS VIEW -->
+      <section id="view-products" class="view">
+        <h2>📦 Ürün Kataloğu</h2>
+        <div id="catalog-meta" style="color:#888; font-size:12px; margin-bottom:14px;">
+          Yükleniyor...
+        </div>
+        <div id="products-grid"></div>
+
+        <h3>Son 50 Okuma (canlı stream)</h3>
+        <div style="max-height:42vh; overflow-y:auto; border:1px solid #2a2a2a; border-radius:4px;">
+          <table id="readings-table">
+            <thead>
+              <tr>
+                <th>Zaman</th>
+                <th>Slot</th>
+                <th>ID</th>
+                <th>Ürün</th>
+                <th>DB Mat.</th>
+                <th>Model Mat.</th>
+                <th>Eşleşme</th>
+                <th>Hamming</th>
+              </tr>
+            </thead>
+            <tbody id="readings-tbody">
+              <tr class="empty-row"><td colspan="8">Henüz okuma yok — Canlı Voxel'e geç ve slot'ları doldur.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
   </div>
 
   <script type="module" src="./main.js"></script>

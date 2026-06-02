@@ -2,24 +2,35 @@
  * Voxel renderer — Bayesian TSDF görselleştirme.
  * PDF Modül 5 Adım 4 (README.md).
  *
+ * C Paketi 2026-06-03: Color = DB lookup (packet.products[].color_hex).
+ *   Recognition head bypass. Eğer products yoksa fallback materials index.
+ *
  * Render kuralları:
  *   - InstancedMesh: 6 slot × 8×8×8 voxel = 3072 instance, tek draw call.
  *   - Opacity   = μ (Bayesian doluluk, sigmoid → [0, 1])
- *   - Color     = material (Metal: gümüş, Plastik: mavi, Ahşap: kahve, Karton: bej)
+ *   - Color     = DB color_hex (products[]) veya fallback material index
  *   - Glow      = σ² yüksekse (bulanık/belirsiz görünüm)
  */
 
 import * as THREE from 'three';
 
 
-// Material renkleri (model index 0..3 → hex)
+// Fallback material renkleri (products field yoksa eski mantık)
 const MATERIAL_COLORS = {
-  0: 0xc0c0c0,  // Metal
-  1: 0x4488ff,  // Plastik
-  2: 0x884422,  // Ahşap
-  3: 0xddccaa,  // Karton
+  0: 0x999999,  // Metal
+  1: 0x3498DB,  // Plastik
+  2: 0x8B4513,  // Ahşap
+  3: 0xF5DEB3,  // Karton
 };
-const EMPTY_COLOR = 0x666666;
+const EMPTY_COLOR = 0x404040;
+
+/** "#RRGGBB" → 0xRRGGBB int */
+function hexToInt(hex) {
+  if (!hex) return EMPTY_COLOR;
+  const s = hex.startsWith('#') ? hex.slice(1) : hex;
+  const n = parseInt(s, 16);
+  return Number.isFinite(n) ? n : EMPTY_COLOR;
+}
 
 // scene.yaml slot_centers_m (classroom_default için, render referans)
 const SLOT_CENTERS = [
@@ -70,9 +81,14 @@ export function createVoxelMesh() {
 export function updateVoxels(mesh, packet) {
   if (!packet || !mesh) return;
   const { nSlots, gx, gy, gz } = mesh.userData;
-  const materials = packet.materials || [];
+  const materials = packet.materials || [];          // model output (fallback)
   const detection = packet.detection_mask || [];
-  const uncertainty = packet.uncertainty || [];     // [6][8][8][8]
+  const uncertainty = packet.uncertainty || [];      // [6][8][8][8]
+  const products = packet.products || [];            // C Paketi: DB lookup
+
+  // Slot → product map (DB lookup için hızlı erişim)
+  const productBySlot = {};
+  products.forEach(p => { productBySlot[p.slot] = p; });
 
   const matrix = new THREE.Matrix4();
   const color = new THREE.Color();
@@ -81,8 +97,17 @@ export function updateVoxels(mesh, packet) {
   let idx = 0;
   for (let s = 0; s < nSlots; s++) {
     const occupied = !!detection[s];
-    const matIdx = (materials[s] !== undefined) ? materials[s] : 0;
-    const baseHex = occupied ? (MATERIAL_COLORS[matIdx] ?? EMPTY_COLOR) : EMPTY_COLOR;
+    // C Paketi: önce DB color_hex, yoksa fallback materials index
+    const product = productBySlot[s];
+    let baseHex;
+    if (!occupied || (product && product.empty)) {
+      baseHex = EMPTY_COLOR;
+    } else if (product && product.color_hex) {
+      baseHex = hexToInt(product.color_hex);          // DB'den
+    } else {
+      const matIdx = (materials[s] !== undefined) ? materials[s] : 0;
+      baseHex = MATERIAL_COLORS[matIdx] ?? EMPTY_COLOR;
+    }
     baseColor.setHex(baseHex);
 
     const center = SLOT_CENTERS[s];

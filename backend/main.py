@@ -171,6 +171,37 @@ async def reset_baseline() -> dict:
     return {"status": "reset_ok"}
 
 
+# ── C Paketi (2026-06-03): Ürün katalog API ────────────────
+
+
+@app.get("/api/products")
+async def list_products() -> dict:
+    """Tüm 16 ürün catalog'unu döndürür (dashboard products view için).
+
+    Recognition head bypass — material classification DB üzerinden yapılır.
+    Identification head'in 7-bit codeword çıktısı → Hamming(7,4) decode →
+    4-bit ID → bu catalog'daki ürün.
+    """
+    engine = app.state.engine
+    if engine.product_db is None:
+        return {"products": [], "count": 0, "error": "ProductDB yüklenmedi"}
+    items = engine.product_db.all()
+    return {
+        "products": items,
+        "count": len(items),
+        "material_palette": engine.product_db.material_palette,
+    }
+
+
+@app.get("/api/products/{product_id}")
+async def get_product(product_id: int) -> dict:
+    """Tek bir ürünü ID ile getir."""
+    engine = app.state.engine
+    if engine.product_db is None:
+        return {"error": "ProductDB yüklenmedi"}
+    return engine.product_db.lookup(product_id)
+
+
 # ── Uvicorn entry point ───────────────────────────────────
 
 

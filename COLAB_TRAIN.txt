@@ -22,8 +22,9 @@
 #
 # TOPLAM SÜRE TAHMİNİ (L4 GPU):
 #   - Hücre 5 smoke test    : ~3-5 dk
-#   - Hücre 6 ana eğitim     : ~30-45 dk (full varyant, 30 ep, 50k)
-#   - Hücre 7 tam ablation   : ~2-3 saat (5 varyant × 30 ep) — OPSİYONEL
+#   - Hücre 6 ana eğitim     : ~40-55 dk (full varyant, 40 ep, 50k) +
+#                              early stop plateau'da daha erken kesebilir
+#   - Hücre 7 tam ablation   : ~2.5-3 saat (3 varyant × 40 ep) — OPSİYONEL
 #
 # NOT: Tek preset olduğu için DANN binary domain shift sinyali yok
 #      (no_dann varyantı = full varyantı ile aynı). Bu yüzden Hücre 6
@@ -35,46 +36,57 @@
 
 
 # ============================================================================
-# HÜCRE 1 — DRIVE MOUNT + REPO HAZIRLIK
+# HÜCRE 1 — DRIVE MOUNT + PROJE YOLU
 # ============================================================================
-# Drive'ı bağla, GitHub'dan en güncel kodu çek, çalışma dizinini ayarla.
-# Süre: ~30 saniye (git clone dahil).
+# Drive'ı bağla, drive'daki PROJESON klasörünü Python path'ine ekle + cwd yap.
+# Veri klasörünü local symlink ile bağla.
+# Süre: ~10-30 saniye (auth dahil).
+#
+# ÖN KOŞUL: Drive'da iki klasör olmalı:
+#   /MyDrive/PROJESON/              ← proje kodu (lokal repo'nun aynısı)
+#   /MyDrive/aether_core/data/      ← üretilmiş 50k veri (classroom_default)
 
 from google.colab import drive
 drive.mount('/content/drive')
 
-import os, subprocess, sys
+import os, sys
 
-REPO_URL  = 'https://github.com/metinboraozke/aether_core.git'
-REPO_PATH = '/content/aether_core'
-DATA_PATH = '/content/drive/MyDrive/aether_core/data'
+PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+DATA_PATH    = '/content/drive/MyDrive/aether_core/data'
 
-# Repo yoksa clone, varsa pull (en güncel B paketi commit'i)
-if not os.path.exists(REPO_PATH):
-    print(f'Cloning {REPO_URL} → {REPO_PATH} ...')
-    subprocess.run(['git', 'clone', REPO_URL, REPO_PATH], check=True)
+# PROJESON'u Python path'ine ekle + çalışma dizini yap (COLAB_RUN.txt mantığı)
+sys.path.insert(0, PROJECT_ROOT)
+os.chdir(PROJECT_ROOT)
+
+# data/ klasörünü drive'a symlink ile bağla
+# MultiDomainDataset varsayılan olarak data_root='data' bekliyor
+local_data = os.path.join(PROJECT_ROOT, 'data')
+if os.path.islink(local_data):
+    print(f'Symlink hazır: {local_data} → {os.readlink(local_data)}')
+elif os.path.isdir(local_data):
+    contents = [f for f in os.listdir(local_data) if f != '.gitkeep']
+    if not contents:
+        # boş data/ (sadece .gitkeep) → sil + symlink kur
+        import shutil
+        shutil.rmtree(local_data)
+        os.symlink(DATA_PATH, local_data)
+        print(f'Symlink kuruldu: {local_data} → {DATA_PATH}')
+    else:
+        # data/ dolu (lokal veri var) — dokunma
+        print(f'data/ klasörü dolu, symlink atlandı ({len(contents)} item)')
 else:
-    print(f'Pulling latest from {REPO_PATH} ...')
-    subprocess.run(['git', '-C', REPO_PATH, 'pull', 'origin', 'main'], check=True)
-
-os.chdir(REPO_PATH)
-sys.path.insert(0, REPO_PATH)
-
-# Veri yolunu lokale symlink ile bağla (data_root='data' default için)
-local_data = os.path.join(REPO_PATH, 'data')
-if not os.path.islink(local_data) and not os.path.isdir(local_data) or \
-        (os.path.isdir(local_data) and not os.listdir(local_data)):
-    if os.path.isdir(local_data):
-        os.rmdir(local_data)
     os.symlink(DATA_PATH, local_data)
-    print(f'Symlink: {local_data} → {DATA_PATH}')
-else:
-    print(f'data/ klasörü hazır: {local_data}')
+    print(f'Symlink kuruldu: {local_data} → {DATA_PATH}')
 
 print('\nWorking dir :', os.getcwd())
-print('Repo commit :', subprocess.check_output(
-    ['git', 'log', '-1', '--oneline'], cwd=REPO_PATH
-).decode().strip())
+print('Klasör sağlık kontrolü:')
+for d in ['configs', 'data_synthesis', 'models', 'training',
+          'preprocessing', 'adaptation']:
+    print(f'  {d:18s}  {"OK" if os.path.isdir(d) else "EKSİK !!"}')
+for f in ['training/ablation.py', 'training/train.py',
+          'data_synthesis/multi_domain_dataset.py',
+          'models/fused_model.py', 'models/heads/recognition_head.py']:
+    print(f'  {f:42s}  {"OK" if os.path.isfile(f) else "EKSİK !!"}')
 
 
 
@@ -135,7 +147,7 @@ import numpy as np
 import os
 
 PRESET = 'classroom_default'
-PDIR = f'/content/aether_core/data/{PRESET}'
+PDIR = f'data/{PRESET}'   # PROJECT_ROOT relative (symlink ile drive'a bağlı)
 
 required = [
     'uwb_cir_oracle.npy', 'uwb_cir_anchor.npy',
@@ -250,9 +262,10 @@ shutil.rmtree('/content/smoke_ckpt', ignore_errors=True)
 
 
 # ============================================================================
-# HÜCRE 6 — ANA EĞİTİM (50k full varyant, 30 epoch, ~30-45 dk L4)
+# HÜCRE 6 — ANA EĞİTİM (50k full varyant, 40 epoch, ~40-55 dk L4)
 # ============================================================================
-# Tek preset, tek varyant (full), tam 50k veri, 30 epoch.
+# Tek preset, tek varyant (full), tam 50k veri, 40 epoch (Identification head
+# için 10 ep buffer). Early stop patience=5 → plateau'da otomatik keser.
 # B paketi tüm patch'leri aktif. Best checkpoint drive'a otomatik yazılır.
 
 import time, torch
@@ -261,7 +274,7 @@ from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with
 from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
 # Production parametreleri
-EPOCHS         = 30
+EPOCHS         = 40
 BATCH_SIZE     = 64        # L4 için uygun (24 GB VRAM)
 LR             = 1.0e-3    # peak lr (warmup sonrası)
 WARMUP_EPOCHS  = 2         # ilk 2 ep lineer warmup 1e-5 → 1e-3

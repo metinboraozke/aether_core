@@ -205,24 +205,37 @@ def train_baseline(
             print(f"[NAN-GUARD] ep {epoch+1} loss={epoch_avg['total']} → "
                   f"recovery (#{nan_recovery_count})")
             if last_safe_state is not None:
-                model.load_state_dict(last_safe_state)
-                # Optimizer state'ini sıfırla (lr ve param group koru)
-                current_lr = optimizer.param_groups[0]["lr"]
-                wd = optimizer.param_groups[0].get("weight_decay", 0.0)
-                optimizer.state = type(optimizer.state)()
+                # 1) Model'i son sağlam state'e geri yükle
+                # Cache CPU'da → orijinal device'a tekrar gönder
+                target_device = next(model.parameters()).device
+                model.load_state_dict({
+                    k: v.to(target_device) for k, v in last_safe_state.items()
+                })
+                # 2) Optimizer state'i IN-PLACE temizle (PyTorch sürüm uyumlu)
+                #    optimizer.state container type'ını koru, sadece içini boşalt
+                #    type(optimizer.state)() PyTorch 2.x'te yanlış container üretiyor
+                #    → AdamW.step() KeyError fırlatıyor. clear() güvenli.
+                optimizer.state.clear()
+                # 3) Lr'i geçici olarak yarıya düşür (bir sonraki adım daha temkinli)
                 for g in optimizer.param_groups:
-                    g["lr"] = current_lr
-                    if "weight_decay" in g:
-                        g["weight_decay"] = wd
-                print(f"[NAN-GUARD] son sağlam state'e geri yüklendi, optimizer reset")
+                    g["lr"] = g["lr"] * 0.5
+                print(f"[NAN-GUARD] son sağlam state yüklendi, "
+                      f"optimizer.state.clear() + lr×0.5 = {optimizer.param_groups[0]['lr']:.2e}")
             else:
-                print(f"[NAN-GUARD] sağlam state yok, epoch atlanıyor")
+                print(f"[NAN-GUARD] sağlam state yok, epoch atlanıyor (cache henüz dolmadı)")
             # NaN epoch'u history'ye yine de kaydet (debug için)
             epoch_avg["nan_recovery"] = True
             history.append(epoch_avg)
             if scheduler is not None:
                 scheduler.step()
+            # 4 ardışık NaN'da eğitimi tamamen durdur (felaket recovery)
+            if nan_recovery_count >= 4:
+                print(f"[NAN-GUARD] {nan_recovery_count} ardışık NaN → eğitim durduruluyor")
+                break
             continue
+        else:
+            # Loss sağlamsa NaN sayacını sıfırla (tek seferlik NaN affedilebilir)
+            nan_recovery_count = 0
 
         # Loss sağlamsa state'i cache'le (CPU clone — bellek dostu)
         last_safe_state = {

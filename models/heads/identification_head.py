@@ -29,7 +29,7 @@ class IdentificationHead(nn.Module):
         latent_dim: int = 64,
         codeword_bits: int = 7,
         hidden: int = 128,
-        dropout: float = 0.1,
+        dropout: float = 0.15,
     ):
         super().__init__()
         self.latent_dim = latent_dim

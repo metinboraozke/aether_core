@@ -135,16 +135,27 @@ def train_baseline(
     log_every: int = 10,
     verbose: bool = True,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    grad_clip_norm: float = 1.0,
 ) -> list[dict]:
     """Sentetik veride supervised eğitim.
 
     scheduler verilirse her epoch sonunda .step() çağrılır ve history'ye
     `lr` alanı eklenir. Verilmezse LR sabit (geriye dönük uyumluluk).
+
+    grad_clip_norm > 0 ise her step'te clip_grad_norm_ uygulanır (P1, default 1.0).
+    grad_clip_norm <= 0 → clip kapalı.
+
+    P2: NaN guard — epoch loss NaN ise en son sağlam state'e geri yüklenir,
+    optimizer reset, epoch atlanır.
     """
     if lambdas is None:
         lambdas = DEFAULT_LAMBDAS
 
     history = []
+    # P2: NaN guard için son sağlam state cache
+    last_safe_state: dict | None = None
+    nan_recovery_count = 0
+
     model.train()
     for epoch in range(epochs):
         epoch_losses: dict[str, list[float]] = {}
@@ -168,6 +179,11 @@ def train_baseline(
             out = model(csi, uwb, link_geo, return_aux=use_aux)
             losses = compute_loss(out, labels, aux_targets=aux, lambdas=lambdas)
             losses["total"].backward()
+            # P1: gradient clipping (NaN patlamasını önler)
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
+                )
             optimizer.step()
 
             for k, v in losses.items():
@@ -182,19 +198,54 @@ def train_baseline(
         epoch_avg["time_s"] = round(time.perf_counter() - t_start, 2)
         # LR'i (epoch sonu, scheduler.step öncesi) kayda al
         epoch_avg["lr"] = float(optimizer.param_groups[0]["lr"])
+
+        # P2: NaN guard — epoch ortalaması finite mi?
+        if not np.isfinite(epoch_avg.get("total", 0.0)):
+            nan_recovery_count += 1
+            print(f"[NAN-GUARD] ep {epoch+1} loss={epoch_avg['total']} → "
+                  f"recovery (#{nan_recovery_count})")
+            if last_safe_state is not None:
+                model.load_state_dict(last_safe_state)
+                # Optimizer state'ini sıfırla (lr ve param group koru)
+                current_lr = optimizer.param_groups[0]["lr"]
+                wd = optimizer.param_groups[0].get("weight_decay", 0.0)
+                optimizer.state = type(optimizer.state)()
+                for g in optimizer.param_groups:
+                    g["lr"] = current_lr
+                    if "weight_decay" in g:
+                        g["weight_decay"] = wd
+                print(f"[NAN-GUARD] son sağlam state'e geri yüklendi, optimizer reset")
+            else:
+                print(f"[NAN-GUARD] sağlam state yok, epoch atlanıyor")
+            # NaN epoch'u history'ye yine de kaydet (debug için)
+            epoch_avg["nan_recovery"] = True
+            history.append(epoch_avg)
+            if scheduler is not None:
+                scheduler.step()
+            continue
+
+        # Loss sağlamsa state'i cache'le (CPU clone — bellek dostu)
+        last_safe_state = {
+            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+        }
+
         history.append(epoch_avg)
 
         # Multi-domain için tek scheduler (warmup + cosine) — restart yok
         if scheduler is not None:
             scheduler.step()
 
+        # P6: per-component loss log
         if verbose:
-            print(f"[ep {epoch+1}] L_total={epoch_avg['total']:.4f}  "
-                  f"det={epoch_avg.get('detection', 0):.3f}  "
-                  f"rec={epoch_avg.get('recognition', 0):.3f}  "
-                  f"id={epoch_avg.get('identification', 0):.3f}  "
-                  f"tsdf={epoch_avg.get('tsdf', 0):.3f}  "
-                  f"lr={epoch_avg['lr']:.2e}  "
+            aux_sum = epoch_avg.get('csi_path', 0) + epoch_avg.get('uwb_path', 0)
+            print(f"[ep {epoch+1}] L={epoch_avg['total']:.3f} "
+                  f"(det={epoch_avg.get('detection', 0):.3f} "
+                  f"rec={epoch_avg.get('recognition', 0):.3f} "
+                  f"id={epoch_avg.get('identification', 0):.3f} "
+                  f"tsdf={epoch_avg.get('tsdf', 0):.3f} "
+                  f"aux={aux_sum:.3f} "
+                  f"kd={epoch_avg.get('kd_oracle', 0):.3f}) "
+                  f"lr={epoch_avg['lr']:.2e} "
                   f"({epoch_avg['time_s']}s)")
     return history
 
@@ -217,6 +268,7 @@ def train_dann_phase(
     verbose: bool = True,
     scheduler_main: torch.optim.lr_scheduler.LRScheduler | None = None,
     scheduler_disc: torch.optim.lr_scheduler.LRScheduler | None = None,
+    grad_clip_norm: float = 1.0,
 ) -> list[dict]:
     """DANN ile (sentetik + simulated_real_domain_id) eğitim.
 
@@ -224,6 +276,7 @@ def train_dann_phase(
     Burada binary için: classroom = 0, diğerleri = 1 (simulated 'real').
 
     scheduler_main / scheduler_disc verilirse her epoch sonunda .step().
+    grad_clip_norm > 0 → main ve discriminator ayrı clip (P1).
     """
     history = []
     model.train()
@@ -259,6 +312,14 @@ def train_dann_phase(
 
             total = L_task["total"] + L_dom
             total.backward()
+            # P1: gradient clipping (main + discriminator ayrı)
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(), max_norm=grad_clip_norm
+                )
             optimizer_main.step()
             optimizer_disc.step()
 

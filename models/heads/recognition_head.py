@@ -28,7 +28,7 @@ class RecognitionHead(nn.Module):
         in_dim: int = 256,
         n_classes: int = 4,
         hidden: int = 128,
-        dropout: float = 0.1,
+        dropout: float = 0.15,
     ):
         super().__init__()
         self.n_classes = n_classes

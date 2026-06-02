@@ -281,7 +281,10 @@ WARMUP_EPOCHS  = 2         # ilk 2 ep lineer warmup 1e-5 → 1e-3
 ETA_MIN        = 1.0e-5    # cosine'in min'i
 VAL_INTERVAL   = 5         # her 5 ep validation
 PATIENCE       = 5         # 5 val_interval iyileşme yoksa early stop
-NUM_WORKERS    = 2         # DataLoader paralel data loading
+NUM_WORKERS    = 0         # Colab notebook multiprocessing bug → 0 zorunlu
+                            # (PyTorch issue #80027: persistent_workers + Jupyter
+                            # process modeli → __del__ AssertionError spam.
+                            # Hız kaybı L4 GPU'da ~%15, kabul edilebilir)
 VAL_SPLIT      = 0.1       # %10 validation (5k val, 45k train)
 SEED           = 42
 

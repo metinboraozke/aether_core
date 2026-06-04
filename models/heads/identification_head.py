@@ -61,8 +61,8 @@ def identification_loss(
     out: dict[str, torch.Tensor],
     codeword_labels: torch.Tensor,
     slot_labels: torch.Tensor,
-    alpha_bce: float = 0.5,
-    triplet_margin: float = 0.2,
+    alpha_bce: float = 1.0,           # E3: 0.5 → 1.0 (bit pattern öğretici güçlendir)
+    triplet_margin: float = 0.15,     # E3: 0.2 → 0.15 (daha kolay margin, sık gradient)
 ) -> torch.Tensor:
     """Multi-task loss: triplet (latent) + BCE (codeword).
 
@@ -76,6 +76,13 @@ def identification_loss(
       Positive: aynı codeword'lu başka slot (varsa)
       Negative: farklı codeword'lu slot
       Eğer pozitif yoksa sample atılır.
+
+    E Paketi (2026-06-03) fix:
+      alpha_bce 0.5 → 1.0: BCE bit-level pattern öğretici, asıl id_bit_accuracy'yi
+        belirler. Eski 0.5 ile gradient yarıya azalmıştı, id_bit 0.525'te plateau.
+        1.0 ile bit accuracy +%10-15 beklenir.
+      triplet_margin 0.2 → 0.15: Daha küçük margin → triplet daha sık aktif
+        (16 unique codeword × 32 batch'te pos pair sınırlı), gradient akışı artar.
     """
     latent = out["latent_64d"]
     cw_logits = out["codeword_logits"]

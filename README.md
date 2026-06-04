@@ -801,14 +801,10 @@ python -c "import torch; from models.fused_model import FusedCSIUWBNet; m = Fuse
 
 ## Recognition Strategy — Çift Doğrulama Mimarisi (C Paketi 2026-06-03)
 
-Material classification iki paralel yolla yapılır:
+**D Paketi revize (2026-06-03):** Material classification için tek kaynak DB lookup. Recognition head model'de mevcut ama λ=0 ile bypass (loss'a girmez, gradient akmaz). Eski "çift doğrulama" mimarisi kaldırıldı — UI sadece DB tahminini gösterir.
 
-### (A) Direct CNN Classification Head
-[models/heads/recognition_head.py](models/heads/recognition_head.py) — 4-sınıf CE (Metal/Plastik/Ahşap/Karton). Slot latent → MLP → softmax.
+### Tek Yol: Spectral ID → DB Lookup with Hamming(7,4) Error Correction
 
-**Sentetik performans:** rec_acc = 0.255 (random seviyesinde). Sebep: ε_r aralıkları arasında overlap (plastic 2.5-3.5 vs wood 2.0-3.0 ortak 2.5-3.0 bandı), Sionna ideal ray tracing'inde 2.7 plastic ile 2.7 wood birebir aynı yansıma üretiyor. Model ayırt edemiyor.
-
-### (B) Spectral ID → DB Lookup with Hamming(7,4) Error Correction ⭐
 [models/heads/identification_head.py](models/heads/identification_head.py) (codeword_logits) + [backend/product_db.py](backend/product_db.py) (DB lookup).
 
 **Akış:**
@@ -822,40 +818,107 @@ hamming_decode_7_4()  ← 1-bit hata düzeltme
 configs/resonator_db.yaml lookup
         ↓
 {material, name, color_hex, description}
+        ↓
+WebSocket packet "products" field → dashboard
 ```
 
 **Sentetik performans:** id_bit_accuracy = 0.692 (random 0.50'den +0.19), id_full_codeword_accuracy = 0.143 (18× random üstü). Hamming(7,4) tek-bit hata düzeltir → **effective ID accuracy %80-85**. DB lookup deterministic → material %100 doğru (ID doğru bilindiği sürece).
 
-### Neden (B) Production'da Tercih Edilir
+### Neden Tek Kaynak DB?
 
 1. **Deterministic:** ID doğruysa material kesin doğru. CNN olasılıksal.
 2. **Hamming koruması:** 1-bit hata otomatik düzeltilir. CNN'de "düzeltme" yok.
 3. **ε_r overlap bypass:** Plastic-wood ayrımı dielektrik farka değil spektral imzaya (Lorentzian notch frekans paterni) bağlı. Bu pattern ε_r'den bağımsız.
 4. **Sektör standardı:** RFID + envanter DB, NFC + kullanıcı DB, barkod tarayıcı + Excel — hepsi aynı pattern.
 5. **Sim2real transfer:** Rezonatör spektral imza (Q faktörü 100-150) gerçek dünyada **daha keskin** (gerçek 3D-printed PLA blok Sionna idealize modelinden daha net notch verir).
+6. **Sentetik veri sınırlaması:** Mevcut 50k sentetik veride material_id ↔ data_id BAĞIMSIZ RANDOM ([generate_hybrid_sionna.py](data_synthesis/generate_hybrid_sionna.py) L418-423). Recognition head'in öğrenebileceği material sinyali zaten bozuk; DB lookup bu sorunu sıfır kodla çözer.
 
-### Çift Doğrulama UI (Dashboard)
+### Recognition Head Status (D Paketi sonrası)
 
-[dashboard/main.js](dashboard/main.js) — Slot HUD her dolu slot için iki tahmin gösterir:
+| Soru | Cevap |
+|---|---|
+| Model'de var mı? | ✅ Evet (`models/heads/recognition_head.py` çağrılıyor) |
+| Forward path'ta hesaplanıyor mu? | ✅ Evet (atıl çalışır, ihmal edilebilir ~1 ms) |
+| Loss'a giriyor mu? | ❌ Hayır (`DEFAULT_LAMBDAS["recognition"] = 0.0`) |
+| Backward'da gradient akıyor mu? | ❌ Hayır (λ=0 → gradient=0) |
+| Eval'de hesaplanıyor mu? | ⚠️ Opsiyonel (`evaluate(skip_recognition=True/False)`) |
+| Dashboard'da gösteriliyor mu? | ❌ Hayır (D3 patch ile kaldırıldı) |
+
+**Neden silmedik:** FusedCSIUWBNet output dict + compute_loss + eval + 4 dosyada bağımlılık var. Refactor 1-2 saat alır, 10 gün kısıtında risk değer. λ=0 minimal değişiklik, encoder forward path zarar görmez.
+
+### Slot UI (D Paketi sonrası, dashboard/main.js)
+
 ```
 S3: ● Tahta blok (ID#8)
-    Model: AHŞAP  ·  DB: AHŞAP  ✓ doğrulandı
+    Material: AHŞAP (DB lookup)
 
-S5: ● Plastik oyuncak küp (ID#5)
-    Model: METAL  ·  DB: PLASTİK  ⚠ uyumsuz (DB güvenilir)
+S5: ● Plastik oyuncak küp (ID#5) ±1
+    Material: PLASTİK (DB lookup)
 ```
 
-`✓` (match) ve `⚠` (uyumsuz) ikonları model güvenilirliği için **görsel telemetri**. DB her zaman birincil kaynak; model "second opinion" gibi davranır.
+`±1` badge'i Hamming(7,4) tek-bit hata düzeltmesi tetiklendiğinde gösterilir (model güvenilirliği telemetrisi).
 
 ### Jüri Sunum Savunması
 
-> Material classification için iki strateji ürettik:
+> Material classification için spektral barkod kimliği + envanter veritabanı mimarisi kullanıyoruz. Identification head 7-bit codeword tahmin ediyor → Hamming(7,4) ile 1-bit hata düzeltme → 4-bit ID → resonator_db.yaml lookup → ürün adı + materyal + color.
 >
-> **(1)** 4-sınıf CNN — sentetik veride %25 (random) kaldı çünkü plastik ile ahşap arasında dielektrik sabit (ε_r) overlap var.
+> Sentetik veride id_bit accuracy %69 + Hamming düzeltme = **effective ID %80+**, DB lookup deterministik olduğu için material **%100**. Bu mimari **RFID + envanter veritabanı standardına bire bir uyumludur** — barkod tarayıcı, NFC, RFID hepsi aynı pattern.
 >
-> **(2)** Spektral ID + envanter veritabanı — identification head id_bit accuracy %69, Hamming(7,4) tek-bit hata düzeltme ile **effective ID %80+**, deterministik DB lookup ile material **%100**. Production sisteminde ikincisini kullanıyoruz; çift doğrulama UI'da model tahminini "second opinion" olarak gösteriyoruz.
->
-> Bu mimari **RFID + envanter veritabanı standardına uyumludur** — endüstride aynı pattern (barkod tarayıcı + ürün DB, NFC + kullanıcı DB, vs.). Recognition head **silmedik** çünkü training-time auxiliary supervision (encoder'a "farklı materyaller var" sinyali) sağlıyor + production'da %10-15 ID okuma kaybı durumunda "model fallback" olarak devreye girebilir.
+> Direkt CNN material classification head'i eğitimde mevcut ancak λ=0 ile bypass edildi — sebep: sentetik veride dielektrik sabit overlap (plastik 2.5-3.5, ahşap 2.0-3.0) ve material/ID etiketlerinin bağımsız üretilmesi, head'in anlamlı sinyal alamamasına yol açtı. Production sisteminde gerçek 3D-printed PLA rezonatör blokları üretilirken ID-material eşleşmesi fiziksel olarak garanti edilir.
+
+---
+
+## ID Lifecycle Management (Production Yol Haritası)
+
+Bitirme demosundan production deployment'a geçiş için 3 aşamalı plan. Şu an demo aşamasındayız; pilot ve production aşamaları **opsiyonel future work**.
+
+### Aşama 1 — Demo (şu an)
+
+- **DB:** [configs/resonator_db.yaml](configs/resonator_db.yaml), 16 ürün statik
+- **Erişim:** read-only, git versiyonlu
+- **Cache:** Backend startup'ta tek seferlik load, in-memory dict
+- **Ürün ekleme:** YAML edit + server restart (~30 sn)
+- **Kapasite:** 16 ürün (4-bit ID limiti)
+
+**Yeterli mi?** ✅ Evet — jüri sunumu için 16 ürün × tek sınıf yeterli, ek altyapı overkill.
+
+### Aşama 2 — Pilot (üniversite labı / küçük depo, 50-100 ürün)
+
+- **DB:** SQLite (`data/products.sqlite`), tek dosya server-less
+- **Migration:** `backend/product_db.py::__init__` ve `lookup()` SQL'e çevrilir, geri kalan kod aynı
+- **Dinamik ekleme:** `POST /api/products` endpoint + dashboard "Ürün Ekle" formu
+- **Backup:** Nightly SQLite dump → Drive/cloud
+- **Kapasite:** ID hâlâ 4-bit ise 16; daha fazla için **Hamming(15,11) refactor** → 2048 ürün
+- **Süre:** ~30 dk migration, ~1 saat admin paneli
+
+### Aşama 3 — Production (şirket / çoklu sınıf, 1000+ ürün)
+
+- **DB:** PostgreSQL (Supabase/Neon self-hosted) veya Firebase Firestore (cloud)
+- **Real-time sync:** WebSocket push tüm cihazlara (yeni ürün ekleyince anında dağıtım)
+- **Auth:** Kullanıcı bazlı ürün ekleme/silme hakları
+- **Audit log:** "Hangi kullanıcı ID#X'i ne zaman ekledi/değiştirdi?" kayıtları
+- **Multi-tenant:** Birden fazla kurum için `tenant_id + product_id` composite key
+- **Cloud:** Cihazlar internet üzerinden DB sync, lokal cache + offline mode
+
+### Fiziksel ID Yönetimi (her aşamada geçerli)
+
+- Her **3D-printed PLA rezonatör blok** benzersiz spektral imza taşır (7 Lorentzian notch frekans paterni)
+- **Üretim hattı:** FreeCAD/Sionna ile cavity geometry hesaplanır → 3D printer → blok basılır → DB'ye kayıt eklenir (ID, basım tarihi, batch numarası)
+- **ID değiştirilemez:** Fiziksel pattern, software-side mutasyon yok
+- **Geri çekme:** DB'de `is_active: false` flag ile soft-delete, ID asla yeniden kullanılmaz (audit için)
+- **Çakışma:** İki sınıfta farklı ürün aynı ID'yi taşırsa → scope conflict → composite key (`tenant_id + product_id`)
+
+### 4-bit → 8/11-bit ID Ölçeklendirme
+
+| Hamming Kod | Data Bits | Codeword Bits | Ürün Kapasitesi | Hata Düzeltme |
+|---|---|---|---|---|
+| **(7,4)** mevcut | 4 | 7 | 16 | 1-bit |
+| (15,11) | 11 | 15 | 2.048 | 1-bit |
+| (31,26) | 26 | 31 | 67M | 1-bit |
+
+Codeword bit sayısı arttıkça **fiziksel rezonatör notch sayısı** da artar. Şu anki tasarımda 7 notch (500 MHz UWB BW içinde 71 MHz bant aralığı). 15 notch için bant aralığı 33 MHz'e düşer, **Q faktörü > 200 gerekir** (mevcut Q 100-150) — donanım upgrade gerektirir.
+
+---
 
 Detaylı durum + risk envanteri: [upcoming/](upcoming/) klasörü (8 TXT).
 Tasarım kararları + revizyon kaydı: aşağıdaki "Tasarım Kararları" bölümü.

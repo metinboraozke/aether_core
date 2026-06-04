@@ -195,6 +195,8 @@ function handlePacket(packet) {
 }
 
 function renderSlotStatus(detection, products) {
+  // D Paketi (2026-06-03): Tek kaynak DB lookup. Material model rec head bypass,
+  // sadece "Material: AHŞAP (DB lookup)" gösterilir. Hamming ±1 badge'i korunur.
   let html = '';
   const productBySlot = {};
   products.forEach(p => { productBySlot[p.slot] = p; });
@@ -211,18 +213,14 @@ function renderSlotStatus(detection, products) {
       html += `<div class="slot-row"><span class="label">S${s + 1}:</span> ● dolu (DB yok)</div>`;
       continue;
     }
-    const modelMat = MATERIAL_NAMES_TR[p.material_model] || '?';
     const dbMat = MATERIAL_NAMES_TR[p.material_db] || '?';
-    const matchIcon = p.match
-      ? '<span class="ok-tick">✓</span>'
-      : '<span class="warn-tick">⚠</span>';
     const hammingFlag = p.hamming_corrected
       ? ' <span class="warn" title="Hamming 1-bit düzeltti">±1</span>'
       : '';
     html += `
       <div class="slot-row">
         <div><span class="label">S${s + 1}:</span> ● <span class="slot-name">${p.name}</span> <span class="slot-id">(ID#${p.id})</span>${hammingFlag}</div>
-        <div class="dual">Model: ${modelMat} &nbsp;·&nbsp; DB: ${dbMat} ${matchIcon}</div>
+        <div class="dual">Material: <span class="value">${dbMat}</span> <span style="color:#666;">(DB lookup)</span></div>
       </div>`;
   }
   const el = document.getElementById('slot-status');

@@ -225,7 +225,7 @@
         </div>
 
         <div id="hud-top-right" class="hud">
-          <h3>SLOT DURUMU (çift doğrulama)</h3>
+          <h3>SLOT DURUMU</h3>
           <div id="slot-status">--</div>
         </div>
 
@@ -239,8 +239,7 @@
           <div style="margin-top:8px;font-size:11px;color:#888;">
             Renk = DB lookup (ID → ürün)<br>
             Opacity = μ (Bayesian doluluk)<br>
-            ✓ = Model & DB eşleşti<br>
-            ⚠ = Uyumsuz (DB güvenilir)
+            ±1 = Hamming(7,4) 1-bit düzeltme
           </div>
         </div>
       </section>
@@ -262,14 +261,12 @@
                 <th>Slot</th>
                 <th>ID</th>
                 <th>Ürün</th>
-                <th>DB Mat.</th>
-                <th>Model Mat.</th>
-                <th>Eşleşme</th>
+                <th>Materyal</th>
                 <th>Hamming</th>
               </tr>
             </thead>
             <tbody id="readings-tbody">
-              <tr class="empty-row"><td colspan="8">Henüz okuma yok — Canlı Voxel'e geç ve slot'ları doldur.</td></tr>
+              <tr class="empty-row"><td colspan="6">Henüz okuma yok — Canlı Voxel'e geç ve slot'ları doldur.</td></tr>
             </tbody>
           </table>
         </div>

@@ -132,8 +132,15 @@ def evaluate(
     loader,
     device: str = "cpu",
     return_aux: bool = False,
+    skip_recognition: bool = False,
 ) -> dict[str, float]:
-    """Loader üzerinde tüm metrikleri topla."""
+    """Loader üzerinde tüm metrikleri topla.
+
+    D Paketi (2026-06-03): skip_recognition=True ise rec_* metrikleri hesaplanmaz.
+    Recognition head λ=0 ile bypass edildiğinde rec_accuracy 0.25 random kalır;
+    sentetik veride material_id ↔ data_id bağımsız random olduğu için anlamsız.
+    Production raporlarında True önerilir.
+    """
     model.eval()
 
     sums: dict[str, float] = {}
@@ -145,7 +152,6 @@ def evaluate(
             uwb = batch["uwb"].to(device)
             link_geo = batch["link_geo"].to(device)
             slot_lbl = batch["labels"]["slot"].to(device)
-            mat_lbl = batch["labels"]["material"].to(device)
             cw_lbl = batch["labels"]["codeword"].to(device)
 
             out = model(csi, uwb, link_geo, return_aux=return_aux)
@@ -154,9 +160,11 @@ def evaluate(
             metrics.update(compute_detection_metrics(
                 out["detection_logits"], slot_lbl
             ))
-            metrics.update(compute_recognition_metrics(
-                out["material_logits"], mat_lbl, slot_lbl
-            ))
+            if not skip_recognition:
+                mat_lbl = batch["labels"]["material"].to(device)
+                metrics.update(compute_recognition_metrics(
+                    out["material_logits"], mat_lbl, slot_lbl
+                ))
             metrics.update(compute_identification_metrics(
                 out["barcode_codeword"], out["barcode_latent"],
                 cw_lbl, slot_lbl

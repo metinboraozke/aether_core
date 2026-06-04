@@ -326,7 +326,9 @@ print(f'Train  : {n_train:,} | Val: {n_val:,}')
 print(f'Batch  : {BATCH_SIZE} | LR: {LR:.0e} → {ETA_MIN:.0e} (warmup {WARMUP_EPOCHS} + cosine)')
 print(f'Device : {device.upper()}')
 print(f'Ckpt   : {CKPT_DIR}')
-print(f'Lambda : DEFAULT (det=1, rec=1, id=1, tsdf=0.3, aux=0.3, kd=0.5)')
+print(f'Lambda : DEFAULT (det=1, rec=0, id=1, tsdf=0.3, aux=0.3, kd=0.5)')
+print(f'         (D Paketi: recognition λ=0 → bypass, material DB lookup ile)')
+print(f'         Beklenen rec_acc ~0.25 random NORMAL — eğitilmez, debug bilgisi.')
 
 t0 = time.perf_counter()
 result = run_single_ablation(

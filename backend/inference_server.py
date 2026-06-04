@@ -239,10 +239,13 @@ class InferenceEngine:
         products = []
         if self.product_db is not None and "codeword_logits_raw" in model_out:
             try:
+                # D Paketi (2026-06-03): material_logits=None → recognition bypass.
+                # Material tek kaynak DB lookup; model rec head'in tahmini paket'e
+                # girmez, dashboard çift doğrulama UI kaldırıldı.
                 products = self.product_db.build_packet_products(
                     detection_mask=det_mask,
                     codeword_logits=model_out["codeword_logits_raw"],
-                    material_logits=model_out.get("material_logits_raw"),
+                    material_logits=None,
                 )
             except Exception as e:
                 print(f"[InferenceEngine] ProductDB build hatası: {e}")
@@ -252,8 +255,8 @@ class InferenceEngine:
         packet = {
             "t_master_ns": frame["t_master_ns"],
             "detection_mask": model_out["detection_mask"],
-            "materials": model_out["materials"],          # MODEL OUTPUT (çift doğrulama)
-            "products": products,                          # YENİ — DB lookup sonuçları
+            "materials": model_out["materials"],          # MODEL OUTPUT (debug, UI'da gösterilmez)
+            "products": products,                          # DB lookup sonuçları (UI primer kaynağı)
             "barcode_sparse": model_out["barcode_sparse"],
             "uncertainty": model_out["uncertainty"],
             "tracking": track,

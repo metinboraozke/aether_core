@@ -82,18 +82,16 @@ export function pushReading(reading) {
 }
 
 function renderHistory() {
+  // D Paketi (2026-06-03): Çift doğrulama kolonları (Model Mat. + Eşleşme) kaldırıldı.
+  // Tek kaynak DB lookup → 6 kolon (Zaman / Slot / ID / Ürün / Materyal / Hamming).
   const tbody = document.getElementById('readings-tbody');
   if (!tbody) return;
   if (history.length === 0) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Henüz okuma yok.</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Henüz okuma yok.</td></tr>';
     return;
   }
   const rows = history.map(r => {
     const dbMat = r.material_db || '?';
-    const modelMat = r.material_model || '-';
-    const match = r.match
-      ? '<span class="match-ok">✓</span>'
-      : '<span class="match-warn">⚠</span>';
     const hamming = r.hamming_corrected
       ? '<span class="match-warn" title="Hamming 1-bit düzeltti">±1</span>'
       : '<span style="color:#666;">—</span>';
@@ -103,8 +101,6 @@ function renderHistory() {
       <td><span class="id-badge">${r.id}</span></td>
       <td>${r.name || '?'}</td>
       <td>${dbMat}</td>
-      <td>${modelMat}</td>
-      <td>${match}</td>
       <td>${hamming}</td>
     </tr>`;
   }).join('');

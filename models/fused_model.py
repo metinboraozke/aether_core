@@ -33,9 +33,15 @@ from models.heads import (
 
 
 # Default loss weights (configs/training.yaml > lambdas)
+# D Paketi (2026-06-03): recognition 1.0 → 0.0 (bypass)
+#   Material classification production'da DB lookup ile yapılır (configs/resonator_db.yaml +
+#   backend/product_db.py). Recognition head model'de kalır (refactor riski yok) ama loss'a
+#   girmez, gradient akmaz. Sebep: rec_acc 0.255 (random) sentetik veride (ε_r overlap +
+#   bağımsız material_id/data_id random), tek kaynak DB lookup mimari karar.
+#   Detay: README "Recognition Strategy" + "ID Lifecycle Management" bölümleri.
 DEFAULT_LAMBDAS = {
     "detection": 1.0,
-    "recognition": 1.0,
+    "recognition": 0.0,         # D Paketi: bypass (DB lookup primer)
     "identification": 1.0,
     "tsdf": 0.3,
     "csi_path": 0.3,           # auxiliary

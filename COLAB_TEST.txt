@@ -893,6 +893,17 @@ for label, idx in SCENARIOS:
 import torch
 from preprocessing import preprocess_csi, preprocess_uwb
 
+# ── INFERENCE-TIME DETECTION THRESHOLD TUNE ─────────────────────
+# Default 0.5 ile sentetik veride detection "şüphe varsa boş de" yatkın
+# (tek dolu sample'larda 0 detect). Eğitim sırasında binomial fill_prob=0.5
+# → n_filled=1 sample'ı %9 sıklıkta → model "az enerji = boş" bias'lı.
+# Threshold'u 0.3'e düşürmek → daha agresif "dolu" tahmini, tek dolu
+# senaryolarda detect eder. E4 patch'i (DetectionHead.forward threshold
+# parametresi) bunu yeniden eğitim olmadan inference-time sağlar.
+# Production'da bu threshold'u tune et — gerçek sensör SNR'sine göre.
+DETECTION_THRESHOLD = 0.3
+
+
 def model_forward_single(sample):
     """Tek bir sample için model forward + DB lookup → products_by_slot dict.
 
@@ -914,7 +925,8 @@ def model_forward_single(sample):
 
     with torch.no_grad():
         out = model(csi, uwb, lg, return_aux=False)
-    det = (torch.sigmoid(out['detection_logits'][0]) > 0.5).cpu().numpy()
+    # Inference-time threshold tune (DETECTION_THRESHOLD = 0.3 yukarıda)
+    det = (torch.sigmoid(out['detection_logits'][0]) > DETECTION_THRESHOLD).cpu().numpy()
     cw_logits = out['barcode_codeword'][0].cpu().numpy()  # (6, 7)
     products = {}
     for s in range(6):
@@ -944,9 +956,10 @@ _det_f1_str = f'{det_f1:.3f}' if 'det_f1' in dir() else '?'
 _id_acc_str = f'{id_accuracy:.3f}' if 'id_accuracy' in dir() else '?'
 plt.suptitle(
     f'Aether Core — 8 Senaryo Test (50 m² Sınıf Ortamı, classroom_default)\n'
-    f'Trainlenmiş model: cla_war_off_150k_2026-06-03/full_best.pt  ·  '
-    f'Detection F1={_det_f1_str}, ID acc={_id_acc_str}',
-    fontsize=14, fontweight='bold', y=0.995
+    f'Model: cla_war_off_150k_2026-06-03/full_best.pt  ·  '
+    f'Det F1={_det_f1_str}, ID acc={_id_acc_str}  ·  '
+    f'Detection threshold={DETECTION_THRESHOLD} (inference-time tune)',
+    fontsize=13, fontweight='bold', y=0.995
 )
 plt.tight_layout(rect=[0, 0, 1, 0.97])
 out_png = '/content/drive/MyDrive/aether_core/test_data/scenarios_full_classroom.png'

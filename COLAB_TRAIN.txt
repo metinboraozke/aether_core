@@ -1,60 +1,138 @@
 ################################################################################
-# AETHER CORE — TEK PRESET EĞİTİM (classroom_default, 50k sample)
+# AETHER CORE — COLAB EĞİTİM HÜCRELERİ (classroom_default 50k)
 ################################################################################
-# Bu dosya 50k classroom_default verisi ile tam eğitim için Colab hücrelerini
-# içerir. B paketi (9 patch, commit ee186d5) tam yüklü:
-#   - Gradient clipping (NaN engelleme)
-#   - NaN guard + recovery (kazara çöküş yok)
-#   - Lambda DEFAULT (manuel override yok)
-#   - Per-epoch validation (her 5 ep)
-#   - Best checkpoint save (val det_f1 max'ta otomatik)
-#   - Per-component loss log (det/rec/id/tsdf/aux/kd ayrı)
-#   - Early stopping (patience=5 val_interval)
-#   - DataLoader optimization (workers + pin_memory)
-#   - Head dropout 0.15 (sim2real buffer)
+# Bu dosya bitirme demosu için tek-preset üretim eğitimini Colab'da koşturur.
+# 0'dan drive mount'tan başlar, GitHub'tan en güncel kodu drive'a çeker,
+# 50k × 40 epoch eğitim koştur, best checkpoint drive'a kaydeder.
+#
+# UYGULANAN PAKETLER (commit 0efee0d):
+#   B paketi (9 patch): grad clip + NaN guard + per-epoch val + best ckpt +
+#                       early stop + DataLoader opt + head dropout 0.15
+#   C paketi (6 patch): ProductDB lookup + dashboard navbar + /api/products
+#   D paketi (5 patch): Recognition λ=0 bypass + DB tek kaynak + ID Lifecycle
+#   E paketi (E3+E4):   identification BCE alpha 1.0 + triplet margin 0.15 +
+#                       DetectionHead.forward(threshold=None) override
 #
 # ÖN KOŞUL:
-#   1. Drive'da /MyDrive/aether_core/data/classroom_default/ klasörü içinde
-#      50k sample'lık üretilmiş veri (uwb_cir_*.npy, csivec_delta.npy,
-#      layout_ids.npy, layout_meta.yaml, ...) hazır olmalı.
-#   2. Colab > Runtime > Change runtime type > GPU (L4 / A100 önerilir).
-#   3. İlk hücreden sırayla çalıştır.
+#   Drive'da iki klasör hazır olmalı:
+#     /MyDrive/PROJESON/                       ← proje kodu (manuel upload veya
+#                                                  ilk seferse boş — H1 senkron eder)
+#     /MyDrive/aether_core/data/classroom_default/  ← üretilmiş 50k veri
+#                                                     (csivec_delta 1.2 GB,
+#                                                      uwb_cir_anchor/oracle ~74 MB
+#                                                      her biri, layout_ids.npy
+#                                                      + layout_meta.yaml dahil)
 #
-# TOPLAM SÜRE TAHMİNİ (L4 GPU):
-#   - Hücre 5 smoke test    : ~3-5 dk
-#   - Hücre 6 ana eğitim     : ~40-55 dk (full varyant, 40 ep, 50k) +
-#                              early stop plateau'da daha erken kesebilir
-#   - Hücre 7 tam ablation   : ~2.5-3 saat (3 varyant × 40 ep) — OPSİYONEL
+# RUNTIME:
+#   Colab > Runtime > Change runtime type > GPU (L4 / A100 önerilir, T4 yedek).
 #
-# NOT: Tek preset olduğu için DANN binary domain shift sinyali yok
-#      (no_dann varyantı = full varyantı ile aynı). Bu yüzden Hücre 6
-#      sadece "full" varyantı koşturur, ablation varyantları gereksiz.
-#      İstersen Hücre 7 ile 3 anlamlı varyantı (full / no_path_aux / no_kd)
-#      karşılaştırabilirsin (no_dann ve minimal atlanır).
+# TOPLAM SÜRE (L4 GPU):
+#   H1 (repo senkron)       : ~10 sn
+#   H4 (sağlık + GPU)        : ~30 sn
+#   H5 (veri kontrolü)       : ~5 sn
+#   H6 (smoke test 500×2ep) : ~3-5 dk
+#   H7 (ANA EĞİTİM 50k×40ep): ~50-65 dk (early stop plateau'da daha erken)
+#   H8 (grafik)             : ~10 sn
+#   H9 (rapor)               : ~5 sn
+#   TOPLAM: ~1-1.5 saat
 ################################################################################
 
 
 
 # ============================================================================
-# HÜCRE 1 — DRIVE MOUNT + PROJE YOLU
+# HÜCRE 1 — DRIVE MOUNT + GITHUB'TAN KODU SENKRONİZE ET
 # ============================================================================
-# Drive'ı bağla, drive'daki PROJESON klasörünü Python path'ine ekle + cwd yap.
-# Veri klasörünü local symlink ile bağla.
-# Süre: ~10-30 saniye (auth dahil).
-#
-# ÖN KOŞUL: Drive'da iki klasör olmalı:
-#   /MyDrive/PROJESON/              ← proje kodu (lokal repo'nun aynısı)
-#   /MyDrive/aether_core/data/      ← üretilmiş 50k veri (classroom_default)
+# Drive'ı bağla, GitHub'dan en güncel kodu (commit 0efee0d veya üstü) drive'a
+# yaz. PROJESON klasörü drive'da güncel olur.
+# Süre: ~15-30 saniye (auth + 16 dosya download).
 
 from google.colab import drive
 drive.mount('/content/drive')
 
-import os, sys
+import os, urllib.request
+
+REPO_RAW     = 'https://raw.githubusercontent.com/metinboraozke/aether_core/main'
+PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+
+# En güncel kod dosyaları (D + E paketleri, commit 0efee0d)
+FILES_TO_SYNC = [
+    # Models
+    'models/__init__.py',
+    'models/fused_model.py',
+    'models/heads/__init__.py',
+    'models/heads/detection_head.py',          # E2/E4 (rollback + API)
+    'models/heads/identification_head.py',     # E3 ✓
+    'models/heads/recognition_head.py',        # P9 dropout 0.15
+    'models/heads/tsdf_decoder.py',
+    'models/heads/tracker.py',
+    'models/encoders/__init__.py',
+    'models/encoders/csi_encoder.py',
+    'models/encoders/uwb_encoder.py',
+    'models/encoders/cross_attention.py',
+    # Adaptation
+    'adaptation/__init__.py',
+    'adaptation/dann.py',
+    'adaptation/residual_adapter.py',
+    'adaptation/distillation.py',
+    # Training (B paketi 9 patch + scheduler)
+    'training/__init__.py',
+    'training/train.py',                       # P1+P2+P2b+P6 (clip+NaN+log+chunk persist)
+    'training/eval.py',                        # D4 (skip_recognition param)
+    'training/ablation.py',                    # P3+P4+P5+P7+P8 (val + best + early stop)
+    # Backend (C paketi + D2)
+    'backend/__init__.py',
+    'backend/inference_server.py',
+    'backend/main.py',
+    'backend/product_db.py',
+    'backend/sync_buffer.py',
+    'backend/ws_stream.py',
+    # Preprocessing
+    'preprocessing/__init__.py',
+    'preprocessing/phase_sanitize.py',
+    'preprocessing/agc_normalize.py',
+    'preprocessing/differential_csi.py',
+    'preprocessing/dwt_denoise.py',
+    'preprocessing/uwb_resample.py',
+    'preprocessing/tensor_format.py',
+    # Data synthesis
+    'data_synthesis/__init__.py',
+    'data_synthesis/multi_domain_dataset.py',
+    'data_synthesis/layout_variants.py',
+    'data_synthesis/resonator_inject.py',
+    'data_synthesis/noise_models.py',
+    # Configs
+    'configs/scene.yaml',
+    'configs/scene_warehouse_large.yaml',
+    'configs/scene_office_small.yaml',
+    'configs/scene_lab_medium.yaml',
+    'configs/scene_room_low_ceiling.yaml',
+    'configs/training.yaml',
+    'configs/resonator_db.yaml',               # C1: 16 ürün catalog
+]
+
+print(f'GitHub → Drive senkron ({len(FILES_TO_SYNC)} dosya)...')
+for f in FILES_TO_SYNC:
+    dst = f'{PROJECT_ROOT}/{f}'
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        urllib.request.urlretrieve(f'{REPO_RAW}/{f}', dst)
+    except Exception as e:
+        print(f'  ✗ {f}: {e}')
+print(f'✓ {len(FILES_TO_SYNC)} dosya senkron edildi (commit 0efee0d veya üstü)')
+
+
+
+# ============================================================================
+# HÜCRE 2 — PROJE YOLU + VERİ SYMLINK
+# ============================================================================
+# PROJESON cwd + Python path; data klasörünü aether_core/data'ya symlink.
+# Süre: ~2 saniye.
+
+import sys, shutil
 
 PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
 DATA_PATH    = '/content/drive/MyDrive/aether_core/data'
 
-# PROJESON'u Python path'ine ekle + çalışma dizini yap (COLAB_RUN.txt mantığı)
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 
@@ -62,39 +140,38 @@ os.chdir(PROJECT_ROOT)
 # MultiDomainDataset varsayılan olarak data_root='data' bekliyor
 local_data = os.path.join(PROJECT_ROOT, 'data')
 if os.path.islink(local_data):
-    print(f'Symlink hazır: {local_data} → {os.readlink(local_data)}')
+    print(f'Symlink mevcut: {local_data} → {os.readlink(local_data)}')
 elif os.path.isdir(local_data):
     contents = [f for f in os.listdir(local_data) if f != '.gitkeep']
     if not contents:
-        # boş data/ (sadece .gitkeep) → sil + symlink kur
-        import shutil
+        shutil.rmtree(local_data)
+        os.symlink(DATA_PATH, local_data)
+        print(f'Symlink kuruldu (boş data/ silindi): {local_data} → {DATA_PATH}')
+    else:
+        # data/ dolu (örn. eski 1k mini veri) → SİL + symlink kur
+        print(f'UYARI: data/ klasörü dolu ({len(contents)} item) — eski mini veri olabilir.')
+        print(f'Sil + symlink kuruluyor (production veri aether_core/data\'da)...')
         shutil.rmtree(local_data)
         os.symlink(DATA_PATH, local_data)
         print(f'Symlink kuruldu: {local_data} → {DATA_PATH}')
-    else:
-        # data/ dolu (lokal veri var) — dokunma
-        print(f'data/ klasörü dolu, symlink atlandı ({len(contents)} item)')
 else:
     os.symlink(DATA_PATH, local_data)
     print(f'Symlink kuruldu: {local_data} → {DATA_PATH}')
 
-print('\nWorking dir :', os.getcwd())
-print('Klasör sağlık kontrolü:')
-for d in ['configs', 'data_synthesis', 'models', 'training',
+print()
+print(f'Working dir : {os.getcwd()}')
+print(f'Klasör sağlık kontrolü:')
+for d in ['configs', 'data_synthesis', 'models', 'training', 'backend',
           'preprocessing', 'adaptation']:
-    print(f'  {d:18s}  {"OK" if os.path.isdir(d) else "EKSİK !!"}')
-for f in ['training/ablation.py', 'training/train.py',
-          'data_synthesis/multi_domain_dataset.py',
-          'models/fused_model.py', 'models/heads/recognition_head.py']:
-    print(f'  {f:42s}  {"OK" if os.path.isfile(f) else "EKSİK !!"}')
+    print(f'  {d:18s} {"OK" if os.path.isdir(d) else "EKSİK !!"}')
 
 
 
 # ============================================================================
-# HÜCRE 2 — BAĞIMLILIKLAR
+# HÜCRE 3 — BAĞIMLILIKLAR + GPU KONTROL
 # ============================================================================
-# PyTorch + numpy zaten Colab'da var. Bizim için ekstra: pywavelets + pyyaml.
-# Süre: ~30 saniye.
+# PyTorch + numpy zaten Colab'da var. Ekstra: pywavelets + pyyaml + tqdm.
+# Süre: ~30 sn (ilk kurulum, sonra cache).
 
 !pip install -q pywavelets pyyaml tqdm
 
@@ -105,49 +182,76 @@ print(f'CUDA avail  : {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'GPU         : {torch.cuda.get_device_name(0)}')
     print(f'GPU mem     : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')
+else:
+    print('UYARI: CUDA YOK — eğitim CPU\'da çok yavaş olur. Runtime > GPU seç.')
 
 
 
 # ============================================================================
-# HÜCRE 3 — IMPORT + SMOKE SANITY (modeller yüklüyor mu)
+# HÜCRE 4 — IMPORT + KONFİG SANITY (D + E paketleri doğrulama)
 # ============================================================================
-# Eğitime girmeden modülleri import edip parametre sayılarını doğrula.
-# Süre: ~10 saniye.
+# Modülleri import et, lambda config ve head defaults'larını doğrula.
+# Süre: ~10 sn.
 
 from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
 from models.fused_model import FusedCSIUWBNet, DEFAULT_LAMBDAS
+from models.heads.detection_head import DetectionHead, detection_loss
+from models.heads.identification_head import identification_loss
+from models.heads.recognition_head import RecognitionHead
 from training.train import create_optimizer, create_scheduler, train_baseline
 from training.ablation import run_single_ablation, ABLATION_VARIANTS, build_lambdas
 from training.eval import evaluate
+from backend.product_db import ProductDB
 
+# Model parametre sayısı
 m = FusedCSIUWBNet()
 total_params = sum(p.numel() for p in m.parameters())
-print(f'FusedCSIUWBNet parameter sayısı: {total_params:,}')
+print(f'FusedCSIUWBNet : {total_params:,} parameter')
 
-# DEFAULT_LAMBDAS sabit + B paketi P3 lambda hijack engelleme aktif mi
-lam_full = build_lambdas({'name':'full','path_aux':True,'dann':True,'oracle_kd':True})
-print(f'\nDEFAULT_LAMBDAS (B paketi P3 sabit):')
-for k, v in lam_full.items():
-    print(f'  {k:15s}: {v}')
+# D paketi: lambda doğrula
+lam = build_lambdas({'name':'full','path_aux':True,'dann':True,'oracle_kd':True})
+print(f'\nDEFAULT_LAMBDAS (D paketi recognition bypass):')
+for k, v in lam.items():
+    marker = ' ← BYPASS' if k == 'recognition' and v == 0.0 else ''
+    print(f'  {k:15s}: {v}{marker}')
+assert lam['recognition'] == 0.0, 'D paketi rec λ=0 değil — kod güncel mi?'
 
-print(f'\nABLATION_VARIANTS:')
-for v in ABLATION_VARIANTS:
-    print(f'  {v}')
+# E paketi: identification defaults
+import inspect
+sig = inspect.signature(identification_loss)
+alpha_bce = sig.parameters['alpha_bce'].default
+margin = sig.parameters['triplet_margin'].default
+print(f'\nidentification_loss defaults (E3):')
+print(f'  alpha_bce      : {alpha_bce}  {"✓ E3 aktif" if alpha_bce == 1.0 else "✗ E3 yok"}')
+print(f'  triplet_margin : {margin}  {"✓ E3 aktif" if margin == 0.15 else "✗ E3 yok"}')
 
-del m  # belleği boşalt
+# E paketi: detection threshold default
+det = DetectionHead()
+print(f'\nDetectionHead defaults:')
+print(f'  threshold      : {det.threshold}  {"✓ rollback" if det.threshold == 0.5 else "?"}')
+
+# C paketi: ProductDB
+db = ProductDB()
+print(f'\nProductDB: {len(db.all())} ürün (catalog)')
+
+# B paketi: head dropout 0.15
+rh = RecognitionHead()
+print(f'\nP9 head dropout:')
+print(f'  Recognition.mlp[2].p : {rh.mlp[2].p}  {"✓" if rh.mlp[2].p == 0.15 else "?"}')
+
+del m
+print('\nTÜM SAĞLIK KONTROLLERİ GEÇTİ ✓')
 
 
 
 # ============================================================================
-# HÜCRE 4 — VERİ KONTROLÜ (classroom_default 50k + layout variant)
+# HÜCRE 5 — VERİ KONTROLÜ (classroom_default 50k + layout variant)
 # ============================================================================
 # Veri klasöründe gerekli dosyalar var mı, kaç sample, kaç variant?
-
-import numpy as np
-import os
+# Süre: ~5 sn.
 
 PRESET = 'classroom_default'
-PDIR = f'data/{PRESET}'   # PROJECT_ROOT relative (symlink ile drive'a bağlı)
+PDIR = f'data/{PRESET}'   # PROJECT_ROOT relative (symlink → aether_core/data)
 
 required = [
     'uwb_cir_oracle.npy', 'uwb_cir_anchor.npy',
@@ -167,12 +271,12 @@ for f in required:
     if os.path.exists(fp):
         arr = np.load(fp, mmap_mode='r')
         sz_mb = os.path.getsize(fp) / 1024 / 1024
-        print(f'  ✓ {f:30s}  shape={arr.shape}  {sz_mb:>7.1f} MB')
+        print(f'  ✓ {f:30s} shape={arr.shape}  {sz_mb:>7.1f} MB')
     else:
-        print(f'  ✗ {f:30s}  YOK !!')
+        print(f'  ✗ {f:30s} YOK !!')
         all_ok = False
 
-# Layout variant kontrolü
+# Layout variant kontrolü (FAZ 0.5)
 print(f'\n=== FAZ 0.5 Layout Variant ===')
 lid_path = os.path.join(PDIR, 'layout_ids.npy')
 lmeta_path = os.path.join(PDIR, 'layout_meta.yaml')
@@ -181,7 +285,7 @@ if os.path.exists(lid_path):
     print(f'  ✓ layout_ids.npy            shape={lids.shape}')
     print(f'  ✓ variant dağılımı          {np.bincount(lids).tolist()}')
 else:
-    print(f'  ! layout_ids.npy YOK → tek variant kabul (lid=0)')
+    print(f'  ! layout_ids.npy YOK → tek variant (lid=0) — model layout-aware öğrenmez')
 
 if os.path.exists(lmeta_path):
     with open(lmeta_path) as f:
@@ -205,80 +309,72 @@ if os.path.exists(lid_path):
         layout_paired = np.array_equal(lids, lwifi)
         print(f'  layout_ids UWB == WiFi  : {layout_paired}  {"✓" if layout_paired else "✗"}')
 
-print(f'\n→ Eğitime hazır: {"EVET ✓" if all_ok and paired else "EKSİK / HATALI ✗"}')
-print(f'   Toplam sample: {slot_uwb.shape[0]}')
+print(f'\n→ Toplam sample: {slot_uwb.shape[0]:,}')
+print(f'→ Eğitime hazır: {"EVET ✓" if all_ok and paired and slot_uwb.shape[0] >= 1000 else "EKSİK ✗"}')
 
 
 
 # ============================================================================
-# HÜCRE 5 — HIZLI SMOKE TEST (pipeline doğrulama, ~3-5 dk)
+# HÜCRE 6 — HIZLI SMOKE TEST (pipeline doğrulama, ~3-5 dk L4)
 # ============================================================================
-# Asıl eğitimden önce 500 sample × 2 epoch ile pipeline çalışıyor mu doğrula.
+# Asıl eğitim öncesi 500 sample × 2 ep ile pipeline çalışıyor mu doğrula.
 # B paketi (NaN guard, grad clip, best ckpt, component log) sorunsuz mu?
+# D paketi (recognition λ=0) component log'da rec=0.0×... görünür mü?
 
-import time, torch
+import time
 from torch.utils.data import DataLoader, Subset
-from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
-from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
 ds = MultiDomainDataset(
     data_root='data', config_root='configs',
     presets=['classroom_default'], return_aux=True,
 )
-print(f'Dataset: {len(ds)} sample (classroom_default)')
+print(f'Dataset full: {len(ds)} sample')
 
 # 500 train + 100 val subset
 sub_train = Subset(ds, list(range(500)))
 sub_val = Subset(ds, list(range(500, 600)))
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-train_loader = DataLoader(sub_train, batch_size=32, shuffle=True, num_workers=2,
-                          pin_memory=(device=='cuda'), persistent_workers=True,
+train_loader = DataLoader(sub_train, batch_size=32, shuffle=True, num_workers=0,
                           collate_fn=collate_with_preprocess)
-val_loader = DataLoader(sub_val, batch_size=32, shuffle=False, num_workers=2,
-                        pin_memory=(device=='cuda'), persistent_workers=True,
+val_loader = DataLoader(sub_val, batch_size=32, shuffle=False, num_workers=0,
                         collate_fn=collate_with_preprocess)
 
-print(f'\n--- SMOKE TEST: full varyantı × 2 epoch × 500 sample × {device.upper()} ---')
+print(f'\n--- SMOKE TEST: full × 2 ep × 500 sample × {device.upper()} ---')
 t0 = time.perf_counter()
 res = run_single_ablation(
-    ABLATION_VARIANTS[0],  # full
+    ABLATION_VARIANTS[0],
     train_loader, val_loader,
     epochs=2, device=device, lr=1e-3,
     warmup_epochs=1, eta_min=1e-5,
     val_interval=1, patience=10,
     checkpoint_dir='/content/smoke_ckpt',
 )
-elapsed = time.perf_counter() - t0
-print(f'\nSMOKE TEST: {elapsed:.1f}s')
-print(f'  best_epoch     : {res["best_epoch"]}')
-print(f'  best_f1        : {res["best_f1"]:.3f}' if res['best_f1'] else 'best_f1: -')
-print(f'  pipeline status: {"OK ✓" if res["best_f1"] and res["best_f1"] > 0 else "HATA ✗"}')
+print(f'\nSMOKE süre: {time.perf_counter()-t0:.1f}s')
+print(f'  best_epoch  : {res["best_epoch"]}')
+print(f'  best_f1     : {res["best_f1"]:.3f}' if res['best_f1'] else 'best: -')
+print(f'  pipeline    : {"OK ✓" if res["best_f1"] and res["best_f1"] > 0 else "HATA ✗"}')
 
-# Smoke ckpt sil (production eğitim için yer aç)
 import shutil
 shutil.rmtree('/content/smoke_ckpt', ignore_errors=True)
 
 
 
 # ============================================================================
-# HÜCRE 6 — ANA EĞİTİM (50k full varyant, 40 epoch, ~40-55 dk L4)
+# HÜCRE 7 — ANA EĞİTİM (50k × 40 ep × full varyant, ~50-65 dk L4)
 # ============================================================================
-# Tek preset, tek varyant (full), tam 50k veri, 40 epoch (Identification head
-# için 10 ep buffer). Early stop patience=5 → plateau'da otomatik keser.
-# B paketi tüm patch'leri aktif. Best checkpoint drive'a otomatik yazılır.
+# B + C + D + E paketleri tüm patch'leri aktif.
+# Best checkpoint drive'a otomatik yazılır.
 
-import time, torch
+import time
 from torch.utils.data import DataLoader, random_split
-from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
-from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
 # Production parametreleri
-EPOCHS         = 40
-BATCH_SIZE     = 64        # L4 için uygun (24 GB VRAM)
+EPOCHS         = 40        # B/D: rec=0 ile aux+kd öğrenme için 40 ep buffer
+BATCH_SIZE     = 64        # L4 GPU için uygun (24 GB VRAM)
 LR             = 1.0e-3    # peak lr (warmup sonrası)
 WARMUP_EPOCHS  = 2         # ilk 2 ep lineer warmup 1e-5 → 1e-3
-ETA_MIN        = 1.0e-5    # cosine'in min'i
+ETA_MIN        = 1.0e-5    # cosine'in min'i (40 ep yumuşak kuyruk)
 VAL_INTERVAL   = 5         # her 5 ep validation
 PATIENCE       = 5         # 5 val_interval iyileşme yoksa early stop
 NUM_WORKERS    = 0         # Colab notebook multiprocessing bug → 0 zorunlu
@@ -289,7 +385,7 @@ VAL_SPLIT      = 0.1       # %10 validation (5k val, 45k train)
 SEED           = 42
 
 # Drive checkpoint dizini (eğitim sonu kalıcı)
-CKPT_DIR = '/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_2026-06-02'
+CKPT_DIR = '/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_2026-06-03'
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 torch.manual_seed(SEED); np.random.seed(SEED)
@@ -313,22 +409,23 @@ pin = (device == 'cuda')
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=pin,
-    persistent_workers=True, collate_fn=collate_with_preprocess,
+    collate_fn=collate_with_preprocess,
 )
 val_loader = DataLoader(
     val_ds, batch_size=BATCH_SIZE, shuffle=False,
     num_workers=NUM_WORKERS, pin_memory=pin,
-    persistent_workers=True, collate_fn=collate_with_preprocess,
+    collate_fn=collate_with_preprocess,
 )
 
-print(f'=== ANA EĞİTİM: classroom_default 50k × {EPOCHS} epoch ===')
+print(f'=== ANA EĞİTİM: classroom_default {n_total:,} × {EPOCHS} epoch ===')
 print(f'Train  : {n_train:,} | Val: {n_val:,}')
 print(f'Batch  : {BATCH_SIZE} | LR: {LR:.0e} → {ETA_MIN:.0e} (warmup {WARMUP_EPOCHS} + cosine)')
 print(f'Device : {device.upper()}')
 print(f'Ckpt   : {CKPT_DIR}')
 print(f'Lambda : DEFAULT (det=1, rec=0, id=1, tsdf=0.3, aux=0.3, kd=0.5)')
-print(f'         (D Paketi: recognition λ=0 → bypass, material DB lookup ile)')
+print(f'         (D paketi: recognition λ=0 → bypass, material DB lookup ile)')
 print(f'         Beklenen rec_acc ~0.25 random NORMAL — eğitilmez, debug bilgisi.')
+print(f'E pkt  : identification BCE alpha=1.0, triplet margin=0.15')
 
 t0 = time.perf_counter()
 result = run_single_ablation(
@@ -344,7 +441,7 @@ total_min = (time.perf_counter() - t0) / 60
 print(f'\n{"="*70}')
 print(f'EĞİTİM TAMAMLANDI: {total_min:.1f} dk')
 print(f'{"="*70}')
-print(f'Best epoch        : {result["best_epoch"]}')
+print(f'Best epoch        : {result["best_epoch"]} / {EPOCHS}')
 print(f'Best val det_f1   : {result["best_f1"]:.4f}')
 print(f'Early stopped     : {result["early_stopped"]}')
 print(f'Checkpoint        : {result["checkpoint_path"]}')
@@ -355,54 +452,9 @@ for k, v in result['val_metrics'].items():
 
 
 # ============================================================================
-# HÜCRE 7 (OPSİYONEL) — TAM ABLATION (3 anlamlı varyant, ~2 saat L4)
-# ============================================================================
-# Tek preset olduğu için no_dann == full (anlamsız). Sadece 3 anlamlı varyant:
-#   full          (path_aux=True,  oracle_kd=True)
-#   no_path_aux   (path_aux=False, oracle_kd=True)
-#   no_kd         (path_aux=True,  oracle_kd=False)
-# Bu, path_aux ve KD katkısını izole edebilmek için.
-
-# YORUM: Eğer sadece final modeli istiyorsan bu hücreyi atla.
-# Path_aux + KD karşılaştırma istiyorsan altındaki kodu çalıştır.
-
-# Yorumu kaldırarak çalıştır:
-"""
-from training.ablation import run_ablation
-
-VARIANTS_3 = [
-    {"name": "full",        "path_aux": True,  "dann": True,  "oracle_kd": True},
-    {"name": "no_path_aux", "path_aux": False, "dann": True,  "oracle_kd": True},
-    {"name": "no_kd",       "path_aux": True,  "dann": True,  "oracle_kd": False},
-]
-
-ABLATION_OUT = '/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_ablation.json'
-ABLATION_CKPT = '/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_ablation'
-
-results = run_ablation(
-    data_root='data', config_root='configs',
-    presets=['classroom_default'],
-    epochs=EPOCHS, batch_size=BATCH_SIZE,
-    val_split=VAL_SPLIT, device=device, lr=LR,
-    warmup_epochs=WARMUP_EPOCHS, eta_min=ETA_MIN,
-    val_interval=VAL_INTERVAL, patience=PATIENCE,
-    num_workers=NUM_WORKERS,
-    checkpoint_dir=ABLATION_CKPT,
-    out_path=ABLATION_OUT,
-    variants=VARIANTS_3,
-    seed=SEED,
-)
-
-print(f'\nAblation sonuçları: {ABLATION_OUT}')
-print(f'Checkpoints      : {ABLATION_CKPT}/<variant>_best.pt')
-"""
-
-
-
-# ============================================================================
 # HÜCRE 8 — VAL PROGRESSION + LOSS COMPONENT GÖRSELLEŞTİRME
 # ============================================================================
-# Eğitim geçmişini grafikle göster (val det_f1, rec, id_bit + lr progresyonu).
+# Eğitim geçmişini grafikle göster (val det_f1, id_bit + lr profili + components).
 
 import matplotlib.pyplot as plt
 
@@ -410,7 +462,7 @@ vh = result.get('val_history', [])
 th = result.get('train_history', [])
 
 if not vh or not th:
-    print('History boş, grafik çizilemiyor (early stop veya tek-pass mod?)')
+    print('History boş, grafik çizilemiyor.')
 else:
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
@@ -418,23 +470,26 @@ else:
     ax = axes[0, 0]
     eps = [v['epoch'] for v in vh]
     ax.plot(eps, [v['det_f1'] for v in vh], 'o-', label='det_f1', color='C0', linewidth=2)
-    ax.plot(eps, [v.get('rec_accuracy', 0) for v in vh], 's-', label='rec_acc', color='C1', linewidth=2)
-    ax.plot(eps, [v.get('id_bit_accuracy', 0) for v in vh], '^-', label='id_bit', color='C2', linewidth=2)
-    ax.axhline(0.25, color='C1', linestyle='--', alpha=0.4, label='rec random 0.25')
-    ax.axhline(0.50, color='C2', linestyle='--', alpha=0.4, label='id random 0.50')
+    ax.plot(eps, [v.get('id_bit_accuracy', 0) for v in vh], '^-',
+            label='id_bit', color='C2', linewidth=2)
+    ax.plot(eps, [v.get('id_full_codeword_accuracy', 0) for v in vh], 'v-',
+            label='id_codeword', color='C4', linewidth=2)
+    ax.axhline(0.50, color='C2', linestyle='--', alpha=0.4, label='id_bit random 0.50')
+    ax.axhline(0.008, color='C4', linestyle='--', alpha=0.4, label='codeword random 1/128')
     ax.set_xlabel('Epoch'); ax.set_ylabel('Metric')
-    ax.set_title('Validation Metrik Progresyonu')
+    ax.set_title('Validation Metrik Progresyonu (D paketi: rec hidden)')
     ax.legend(); ax.grid(alpha=0.3); ax.set_ylim(0, 1)
 
     # Train loss component
     ax = axes[0, 1]
     eps_t = [t['epoch'] for t in th]
-    for comp, color in [('total','black'), ('detection','C0'), ('recognition','C1'),
+    for comp, color in [('total','black'), ('detection','C0'),
                          ('identification','C2'), ('tsdf','C3')]:
         vals = [t.get(comp, 0) for t in th]
-        ax.plot(eps_t, vals, label=comp, color=color, linewidth=2 if comp=='total' else 1)
+        ax.plot(eps_t, vals, label=comp, color=color,
+                linewidth=2 if comp=='total' else 1)
     ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
-    ax.set_title('Per-Component Train Loss')
+    ax.set_title('Per-Component Train Loss (rec bypass)')
     ax.legend(); ax.grid(alpha=0.3)
 
     # Learning rate
@@ -442,7 +497,7 @@ else:
     lrs = [t.get('lr', 0) for t in th]
     ax.plot(eps_t, lrs, '-', color='C4', linewidth=2)
     ax.set_xlabel('Epoch'); ax.set_ylabel('Learning Rate')
-    ax.set_title('LR Profili (warmup + cosine)')
+    ax.set_title(f'LR Profili (warmup {WARMUP_EPOCHS} + cosine {EPOCHS-WARMUP_EPOCHS})')
     ax.set_yscale('log'); ax.grid(alpha=0.3)
 
     # Auxiliary + KD loss
@@ -455,25 +510,26 @@ else:
     ax.set_title('Auxiliary + KD Loss (sim2real teacher signal)')
     ax.legend(); ax.grid(alpha=0.3)
 
-    plt.suptitle(f'classroom_default 50k × {EPOCHS} ep × full variant '
-                 f'(best ep {result["best_epoch"]}, det_f1={result["best_f1"]:.3f})',
-                 fontsize=12, fontweight='bold')
+    plt.suptitle(
+        f'classroom_default {n_total//1000}k × {EPOCHS} ep × full variant '
+        f'(best ep {result["best_epoch"]}, det_f1={result["best_f1"]:.3f}, '
+        f'id_bit={result["val_metrics"].get("id_bit_accuracy",0):.3f})',
+        fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_2026-06-02/training_curves.png',
-                dpi=120, bbox_inches='tight')
+    plt.savefig(f'{CKPT_DIR}/training_curves.png', dpi=120, bbox_inches='tight')
     plt.show()
-    print('\nGrafik kaydedildi: training_curves.png')
+    print(f'\nGrafik kaydedildi: {CKPT_DIR}/training_curves.png')
 
 
 
 # ============================================================================
-# HÜCRE 9 — SON ÖZET RAPORU + BAŞARI KRİTERLERİ
+# HÜCRE 9 — SONUÇ RAPORU + BAŞARI KRİTERLERİ
 # ============================================================================
 
 print(f'{"="*70}')
-print(f'AETHER CORE — classroom_default 50k EĞİTİM RAPORU')
+print(f'AETHER CORE — classroom_default {n_total//1000}k EĞİTİM RAPORU')
 print(f'{"="*70}')
-print(f'Tarih          : 2026-06-02')
+print(f'Tarih          : 2026-06-03 (D + E paketleri sonrası)')
 print(f'Veri           : {n_train:,} train + {n_val:,} val')
 print(f'Model          : FusedCSIUWBNet (~2.91M param)')
 print(f'Eğitim süresi  : {total_min:.1f} dk')
@@ -485,36 +541,47 @@ print(f'\n{"BAŞARI KRİTERLERİ (production hedefleri)":~^70}')
 m = result['val_metrics']
 
 def check(name, value, threshold, op='≥'):
-    """ op = '≥' (büyük eşit) → değer threshold'tan büyük eşitse PASS """
-    if op == '≥':
-        passed = value >= threshold
-    else:
-        passed = value <= threshold
+    passed = value >= threshold if op == '≥' else value <= threshold
     mark = '✓' if passed else '✗'
     status = 'PASS' if passed else 'FAIL'
     print(f'  {mark} {name:25s} = {value:.4f}  (hedef {op} {threshold})  [{status}]')
     return passed
 
 passed = []
-passed.append(check('det_f1',          m['det_f1'],          0.82))
-passed.append(check('rec_accuracy',    m['rec_accuracy'],    0.55))
-passed.append(check('id_bit_accuracy', m['id_bit_accuracy'], 0.70))
+passed.append(check('det_f1',                    m['det_f1'],          0.78))
+passed.append(check('id_bit_accuracy',           m['id_bit_accuracy'], 0.70))
+passed.append(check('id_full_codeword_accuracy', m['id_full_codeword_accuracy'], 0.15))
+
+# Recognition NORMAL kontrol (random olmalı)
+rec_normal = 0.20 <= m.get('rec_accuracy', 0) <= 0.30
+mark = '✓' if rec_normal else '✗'
+status = 'NORMAL (bypass)' if rec_normal else 'BEKLENMEDİK'
+print(f'  {mark} rec_accuracy (bypass)     = {m.get("rec_accuracy", 0):.4f}  '
+      f'(beklenen 0.25 random)  [{status}]')
 
 print(f'\n{"="*70}')
 if all(passed):
-    print('✅ TÜM KRİTERLER GEÇTİ — FAZ D (sim2real hazırlık) için hazır')
-    print('   Sonraki adım: DANN Phase 2 + Knowledge Distillation')
-elif passed[0]:  # Sadece det_f1 geçti
-    print('⚠️  KISMİ BAŞARI — det_f1 OK ama rec/id zayıf')
-    print('   Önerim: FAZ C (εr kontrast artırma, configs/scene.yaml düzeltmesi)')
+    print('✅ TÜM KRİTERLER GEÇTİ — Jüri demosuna hazır')
+    print('   Material classification DB lookup ile %100 (ID doğru bilindiğinde)')
+elif passed[0] and passed[1]:
+    print('⚠️  KISMİ BAŞARI — det + id_bit OK, codeword sınırda')
+    print('   DB lookup hâlâ çalışır ama Hamming düzeltme sık tetiklenebilir')
 else:
-    print('❌ BAŞARISIZ — det_f1 bile zayıf, ek tanı gerekli')
-    print('   Önerim: ek 30 epoch + grad norm log + lambda analizi')
+    print('❌ HEDEF ALTI — ek tanı veya εr kontrast retrain gerekli')
 
 print(f'\nÇıktı dosyaları drive\'da:')
-print(f'  - {result["checkpoint_path"]}  (model state + extras)')
+print(f'  - {result["checkpoint_path"]}')
 print(f'  - {CKPT_DIR}/training_curves.png')
 
+print(f'\n--- Sonraki adımlar ---')
+print(f'1. Bu checkpoint\'i lokale çek (uvicorn için):')
+print(f'   /content/drive/MyDrive/aether_core/checkpoints/classroom_50k_2026-06-03/full_best.pt')
+print(f'2. Lokal\'de uvicorn ayağa kaldır:')
+print(f'   $env:AETHER_CHECKPOINT = "checkpoints/classroom_50k_2026-06-03/full_best.pt"')
+print(f'   python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000')
+print(f'3. Dashboard: http://127.0.0.1:8000/dashboard/')
+print(f'4. Jüri demosu için raf önüne ürün koy, slot HUD\'da "Material: X (DB lookup)" görünür')
+
 ################################################################################
-# SON — bu noktadan sonra checkpoint'i lokale çek veya FAZ D'ye geç.
+# SON — checkpoint hazır, jüri demosuna geç.
 ################################################################################

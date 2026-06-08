@@ -570,3 +570,373 @@ ile gerçek ortam fine-tune (1-2 gün), beklenen accuracy +%10-15.
 #   /MyDrive/aether_core/test_data/voxel_predictions.png
 #   /MyDrive/aether_core/test_data/test_predictions.csv
 ################################################################################
+
+
+
+################################################################################
+# VOL2 — TÜM SINIF ORTAMI + KAPSAMLI SENARYO TESTİ
+################################################################################
+# H1-H9 sadece RAF voxel'lerini gösteriyordu (5 m² alan).
+# VOL2 ise tam 50 m² SINIF ORTAMINI render eder:
+#   - 10 × 5 × 3 m oda wireframe
+#   - 8 ESP32 sensör konumları (4 master + 4 satellite)
+#   - 4 UWB sensör (master node'lar)
+#   - Raf + 6 slot wireframe (modelin gözünden bakış)
+#   - Dolu slot'lar DB color_hex + ürün adı etiketi
+#
+# Ayrıca KAPSAMLI 8 SENARYO testi:
+#   1. Boş raf            (n_filled=0)
+#   2. Tek dolu (sol)     (S1)
+#   3. Tek dolu (sağ)     (S6)
+#   4. Yarı dolu (sol kolon)  (S1, S3, S5)
+#   5. Yarı dolu (sağ kolon)  (S2, S4, S6)
+#   6. Tam dolu (6 ürün)
+#   7. Tek materyal (sadece plastik veya sadece ahşap)
+#   8. Karışık (4 materyal sınıfı bir arada)
+#
+# Mevcut 1k test verisinden bu senaryolara en yakın sample'ları filtre eder,
+# modeli her birine besler, tüm sınıf ortamını 4×2 grid'de yan yana basar.
+#
+# Süre: H4 zaten çalıştıysa ek 1-2 dk (sadece filter + render).
+################################################################################
+
+
+
+# ============================================================================
+# HÜCRE 10 — VOL2 #1: TAM SINIF 3D RENDER HELPER
+# ============================================================================
+# Tüm sınıf ortamını (10x5x3 m oda + sensörler + raf + slot'lar) çizen
+# fonksiyon. Her senaryo için tekrar tekrar çağrılır.
+
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import yaml
+
+# Scene config oku (classroom_default — diğer preset'ler benzer geometri)
+with open('configs/scene.yaml', encoding='utf-8') as f:
+    SCENE_CFG = yaml.safe_load(f)
+
+ROOM_W = float(SCENE_CFG['room']['width_m'])    # 10 m
+ROOM_D = float(SCENE_CFG['room']['depth_m'])    # 5 m
+ROOM_H = float(SCENE_CFG['room']['height_m'])   # 3 m
+
+SHELF_CENTER = SCENE_CFG['shelf']['center_xyz_m']    # [5.0, 2.5, 1.5]
+SHELF_SIZE   = SCENE_CFG['shelf']['size_xyz_m']      # [1.0, 0.4, 1.0]
+SLOT_SIZE    = SCENE_CFG['shelf']['slot_size_m']     # [0.5, 0.4, 0.33]
+SLOT_CENTERS = SCENE_CFG['slot_centers_m']
+
+# ESP32 + UWB sensör konumları (hibrit topoloji: 4 master + 4 satellite)
+NODES = SCENE_CFG['nodes']
+ESP32_NODES = [n for n in NODES if 'esp32' in n.get('sensors', [])]
+UWB_NODES   = [n for n in NODES if 'uwb' in n.get('sensors', [])]
+
+print(f'Sınıf: {ROOM_W}×{ROOM_D}×{ROOM_H} m')
+print(f'Raf  : center={SHELF_CENTER}, size={SHELF_SIZE}')
+print(f'ESP32: {len(ESP32_NODES)} sensör ({sum(1 for n in ESP32_NODES if n["type"]=="master")} M + '
+      f'{sum(1 for n in ESP32_NODES if n["type"]=="satellite")} S)')
+print(f'UWB  : {len(UWB_NODES)} sensör (master\'lar)')
+
+
+def _draw_box(ax, center, size, color='gray', alpha=0.15, edge_color=None, lw=0.7):
+    """Wireframe + opsiyonel fill box."""
+    x, y, z = center
+    dx, dy, dz = size
+    if edge_color is None:
+        edge_color = color
+    # 12 kenar
+    corners = [
+        (x-dx/2, y-dy/2, z-dz/2), (x+dx/2, y-dy/2, z-dz/2),
+        (x+dx/2, y+dy/2, z-dz/2), (x-dx/2, y+dy/2, z-dz/2),
+        (x-dx/2, y-dy/2, z+dz/2), (x+dx/2, y-dy/2, z+dz/2),
+        (x+dx/2, y+dy/2, z+dz/2), (x-dx/2, y+dy/2, z+dz/2),
+    ]
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),  # bottom
+        (4,5),(5,6),(6,7),(7,4),  # top
+        (0,4),(1,5),(2,6),(3,7),  # verticals
+    ]
+    for i, j in edges:
+        xs = [corners[i][0], corners[j][0]]
+        ys = [corners[i][1], corners[j][1]]
+        zs = [corners[i][2], corners[j][2]]
+        ax.plot(xs, ys, zs, color=edge_color, alpha=alpha*3, linewidth=lw)
+
+
+def render_full_classroom(ax, products_by_slot, title='', view=(20, 35)):
+    """Tüm 50 m² sınıf ortamını 3D render et.
+
+    Args:
+        ax: matplotlib 3D axes
+        products_by_slot: dict {slot_idx: product_info} (dolu slot'lar)
+        title: subplot başlık
+        view: (elev, azim) kamera açısı
+    """
+    # 1) ODA wireframe
+    _draw_box(ax, [ROOM_W/2, ROOM_D/2, ROOM_H/2], [ROOM_W, ROOM_D, ROOM_H],
+              edge_color='#444444', alpha=0.4, lw=0.8)
+
+    # Zemin (yarı şeffaf plane efekt — düşük opacity çizgi grid)
+    for x_g in np.arange(0, ROOM_W+0.01, 1.0):
+        ax.plot([x_g, x_g], [0, ROOM_D], [0, 0], color='#1a1a1a', alpha=0.3, lw=0.3)
+    for y_g in np.arange(0, ROOM_D+0.01, 1.0):
+        ax.plot([0, ROOM_W], [y_g, y_g], [0, 0], color='#1a1a1a', alpha=0.3, lw=0.3)
+
+    # 2) RAF wireframe (dış kenar)
+    _draw_box(ax, SHELF_CENTER, SHELF_SIZE,
+              edge_color='#888888', alpha=0.5, lw=1.0)
+
+    # 3) 6 SLOT wireframe
+    for s_idx, center in enumerate(SLOT_CENTERS):
+        _draw_box(ax, center, SLOT_SIZE,
+                  edge_color='#4caf50', alpha=0.25, lw=0.6)
+
+    # 4) DOLU SLOT'LAR — DB color_hex + ürün adı
+    for s_idx, info in products_by_slot.items():
+        center = SLOT_CENTERS[s_idx]
+        color = info.get('color_hex', '#999999')
+        name = info.get('name', '?')[:18]
+        # Solid cube fill
+        ax.bar3d(center[0]-SLOT_SIZE[0]/2, center[1]-SLOT_SIZE[1]/2,
+                 center[2]-SLOT_SIZE[2]/2,
+                 SLOT_SIZE[0], SLOT_SIZE[1], SLOT_SIZE[2],
+                 color=color, alpha=0.85, edgecolor='black', linewidth=0.5)
+        # Etiket
+        ax.text(center[0], center[1], center[2]+SLOT_SIZE[2]/2+0.05,
+                f"S{s_idx+1}\nID#{info.get('id','?')}\n{name}",
+                fontsize=6, ha='center', va='bottom',
+                color='white',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='black',
+                          alpha=0.6, edgecolor='none'))
+
+    # 5) ESP32 sensörler (4M kırmızı + 4S sarı) + UWB master (mavi halka)
+    uwb_positions = {tuple(n['position_m']) for n in UWB_NODES}
+    for n in ESP32_NODES:
+        pos = n['position_m']
+        is_master = n['type'] == 'master'
+        color = '#e74c3c' if is_master else '#f39c12'
+        marker = 's' if is_master else '^'
+        ax.scatter([pos[0]], [pos[1]], [pos[2]], c=color, marker=marker,
+                   s=40 if is_master else 25, edgecolors='black', linewidths=0.5)
+        ax.text(pos[0], pos[1], pos[2]+0.15, n['id'],
+                fontsize=6, ha='center', color=color, fontweight='bold')
+        # UWB var ise mavi halka ekle
+        if tuple(pos) in uwb_positions:
+            # Küçük mavi nokta UWB göstergesi (master'ın yanında)
+            ax.scatter([pos[0]+0.05], [pos[1]], [pos[2]+0.05], c='#3498db',
+                       marker='o', s=20, edgecolors='black', linewidths=0.3)
+
+    # 6) Axes ayarları
+    ax.set_xlim(0, ROOM_W)
+    ax.set_ylim(0, ROOM_D)
+    ax.set_zlim(0, ROOM_H)
+    ax.set_xlabel('X (m)', fontsize=7)
+    ax.set_ylabel('Y (m)', fontsize=7)
+    ax.set_zlabel('Z (m)', fontsize=7)
+    ax.set_title(title, fontsize=9, pad=8)
+    ax.view_init(elev=view[0], azim=view[1])
+    ax.tick_params(labelsize=6)
+    # Arkaplan beyaz
+    ax.xaxis.pane.fill = False; ax.yaxis.pane.fill = False; ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor('white'); ax.yaxis.pane.set_edgecolor('white'); ax.zaxis.pane.set_edgecolor('white')
+
+
+# Tek sample test render — sanity
+print('\nTek sample test render hazır.')
+
+
+
+# ============================================================================
+# HÜCRE 11 — VOL2 #2: 8 SENARYO FİLTRELEME (mevcut 1k'dan)
+# ============================================================================
+# Mevcut test setinden farklı doluluk/materyal pattern'ine sahip sample'ları
+# filtrele. Yoksa en yakın eşleşmeyi al.
+
+from collections import defaultdict
+
+# Her sample için ground truth özet hazırla
+sample_summary = {}
+for i in range(len(test_ds)):
+    s = test_ds[i]
+    slot_gt = s['labels']['slot'].numpy()
+    mat_gt = s['labels']['material'].numpy()
+    n_filled = int(slot_gt.sum())
+    filled_slots = [int(idx) for idx in np.where(slot_gt == 1)[0]]
+    materials = [int(mat_gt[idx]) for idx in filled_slots]
+    unique_mats = set(materials)
+    sample_summary[i] = {
+        'n_filled': n_filled,
+        'filled_slots': filled_slots,
+        'materials': materials,
+        'unique_mat_count': len(unique_mats),
+    }
+
+# 8 senaryo için en uygun sample'ları seç
+def find_sample(predicate, fallback_min_filled=None):
+    """Predicate'e uyan ilk sample'ı bul, yoksa fallback."""
+    for idx, info in sample_summary.items():
+        if predicate(info):
+            return idx
+    if fallback_min_filled is not None:
+        # Fallback: belirli minimum dolu slot'lu ilk sample
+        for idx, info in sample_summary.items():
+            if info['n_filled'] >= fallback_min_filled:
+                return idx
+    return list(sample_summary.keys())[0]
+
+SCENARIOS = [
+    ('Senaryo 1: Boş raf',
+     find_sample(lambda i: i['n_filled'] == 0, fallback_min_filled=0)),
+    ('Senaryo 2: Tek dolu (sol kolon)',
+     find_sample(lambda i: i['n_filled'] == 1 and i['filled_slots'][0] in [0, 2, 4],
+                 fallback_min_filled=1)),
+    ('Senaryo 3: Tek dolu (sağ kolon)',
+     find_sample(lambda i: i['n_filled'] == 1 and i['filled_slots'][0] in [1, 3, 5],
+                 fallback_min_filled=1)),
+    ('Senaryo 4: Yarı dolu (sol kolon S1+S3+S5)',
+     find_sample(lambda i: set(i['filled_slots']) == {0, 2, 4},
+                 fallback_min_filled=3)),
+    ('Senaryo 5: Yarı dolu (sağ kolon S2+S4+S6)',
+     find_sample(lambda i: set(i['filled_slots']) == {1, 3, 5},
+                 fallback_min_filled=3)),
+    ('Senaryo 6: Tam dolu (6 ürün)',
+     find_sample(lambda i: i['n_filled'] == 6, fallback_min_filled=5)),
+    ('Senaryo 7: Tek materyal',
+     find_sample(lambda i: i['n_filled'] >= 3 and i['unique_mat_count'] == 1,
+                 fallback_min_filled=3)),
+    ('Senaryo 8: Karışık 4 materyal',
+     find_sample(lambda i: i['n_filled'] >= 4 and i['unique_mat_count'] == 4,
+                 fallback_min_filled=4)),
+]
+
+print(f'{"="*70}')
+print(f'8 SENARYO SEÇİLDİ (mevcut {len(test_ds)} sample içinden)')
+print(f'{"="*70}')
+for label, idx in SCENARIOS:
+    s_info = sample_summary[idx]
+    print(f'  {label}')
+    print(f'    sample_idx={idx}  n_filled={s_info["n_filled"]}  '
+          f'filled_slots={s_info["filled_slots"]}  unique_mats={s_info["unique_mat_count"]}')
+
+
+
+# ============================================================================
+# HÜCRE 12 — VOL2 #3: SENARYO BAZINDA INFERENCE + 4x2 GRID GÖRSEL
+# ============================================================================
+# Her senaryoya modeli besle, tahminleri al, tüm sınıf ortamını render et.
+
+import torch
+
+def model_forward_single(sample):
+    """Tek bir sample için model forward + DB lookup → products_by_slot dict."""
+    csi = torch.from_numpy(np.asarray(sample['csi'])).float().unsqueeze(0).to(device)
+    uwb = torch.from_numpy(np.asarray(sample['uwb'])).float().unsqueeze(0).to(device)
+    lg = torch.from_numpy(np.asarray(sample['link_geo'])).float().unsqueeze(0).to(device)
+    with torch.no_grad():
+        out = model(csi, uwb, lg, return_aux=False)
+    det = (torch.sigmoid(out['detection_logits'][0]) > 0.5).cpu().numpy()
+    cw_logits = out['barcode_codeword'][0].cpu().numpy()  # (6, 7)
+    products = {}
+    for s in range(6):
+        if not det[s]:
+            continue
+        bits = (cw_logits[s] > 0).astype(np.uint8)
+        data_4bit, corrected = hamming_decode_7_4(bits)
+        pid = int(data_bits_to_int(data_4bit))
+        info = db.lookup(pid)
+        info['hamming_corrected'] = bool(corrected)
+        products[s] = info
+    return products, det
+
+# 4×2 grid render (8 senaryo)
+fig = plt.figure(figsize=(22, 16), facecolor='white')
+for plot_idx, (label, sample_idx) in enumerate(SCENARIOS, 1):
+    sample = test_ds[sample_idx]
+    products_by_slot, det_pred = model_forward_single(sample)
+
+    ax = fig.add_subplot(2, 4, plot_idx, projection='3d')
+    n_pred_filled = int(det_pred.sum())
+    n_gt_filled = sample_summary[sample_idx]['n_filled']
+    title = f'{label}\nsample #{sample_idx}  ·  GT dolu: {n_gt_filled}  ·  Tahmin dolu: {n_pred_filled}'
+    render_full_classroom(ax, products_by_slot, title=title, view=(22, 35))
+
+plt.suptitle(
+    f'Aether Core — 8 Senaryo Test (50 m² Sınıf Ortamı, classroom_default)\n'
+    f'Trainlenmiş model: cla_war_off_150k_2026-06-03/full_best.pt  ·  '
+    f'Detection F1={det_f1:.3f}, ID acc={id_accuracy:.3f}',
+    fontsize=14, fontweight='bold', y=0.995
+)
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+out_png = '/content/drive/MyDrive/aether_core/test_data/scenarios_full_classroom.png'
+plt.savefig(out_png, dpi=120, bbox_inches='tight', facecolor='white')
+plt.show()
+print(f'\n8-senaryo görsel kaydedildi: {out_png}')
+
+
+
+# ============================================================================
+# HÜCRE 13 — VOL2 #4: TEK SENARYO YAKIN ÇEKİM + SENSÖR DETAYI
+# ============================================================================
+# Bir senaryoyu (tam dolu) BÜYÜK boyutta + 4 farklı kamera açısından render.
+# Jüri demosunda detaylı bakmak için.
+
+# Tam dolu senaryoyu seç
+full_label, full_idx = SCENARIOS[5]   # "Senaryo 6: Tam dolu (6 ürün)"
+sample = test_ds[full_idx]
+products_by_slot, _ = model_forward_single(sample)
+
+fig = plt.figure(figsize=(20, 16), facecolor='white')
+views = [(15, 30), (25, 60), (40, 120), (60, 200)]
+view_names = ['Standart 30°', 'Yan açı 60°', 'Yüksek açı 120°', 'Arka 200°']
+
+for plot_idx, (view, vname) in enumerate(zip(views, view_names), 1):
+    ax = fig.add_subplot(2, 2, plot_idx, projection='3d')
+    title = f'{vname}  (sample #{full_idx})\n{len(products_by_slot)} dolu slot'
+    render_full_classroom(ax, products_by_slot, title=title, view=view)
+
+plt.suptitle(
+    f'Aether Core — Tam Dolu Raf, 4 Kamera Açısı\n'
+    f'8 ESP32 (kırmızı M / sarı S) + 4 UWB (mavi nokta) + 6 slot doluluk DB lookup',
+    fontsize=14, fontweight='bold', y=0.99
+)
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+out_png2 = '/content/drive/MyDrive/aether_core/test_data/scenario_full_4angles.png'
+plt.savefig(out_png2, dpi=120, bbox_inches='tight', facecolor='white')
+plt.show()
+print(f'\n4-açılı detay görsel kaydedildi: {out_png2}')
+
+# Tablo: tam dolu senaryo için tüm slot tahminleri
+print(f'\n{"="*70}')
+print(f'TAM DOLU SENARYO DETAY (sample #{full_idx})')
+print(f'{"="*70}')
+gt = test_ds[full_idx]['labels']
+gt_slot = gt['slot'].numpy()
+gt_mat = gt['material'].numpy()
+gt_cw = gt['codeword'].numpy()
+MAT_NAMES = ['boş', 'metal', 'plastik', 'ahşap', 'karton']
+print(f'  {"Slot":4s} {"GT Dolu":>8s} {"GT Mat":>10s} {"Pred Dolu":>10s} '
+      f'{"Pred ID":>8s} {"Pred Ürün":>25s} {"Pred Mat":>10s} {"Hamming":>8s}')
+print(f'  {"-"*4} {"-"*8} {"-"*10} {"-"*10} {"-"*8} {"-"*25} {"-"*10} {"-"*8}')
+for s in range(6):
+    gt_pid = int(data_bits_to_int(hamming_decode_7_4(gt_cw[s].astype(np.uint8))[0]))
+    info = products_by_slot.get(s, {'id': '-', 'name': 'boş tahmin',
+                                      'material': '-', 'hamming_corrected': False})
+    pred_dolu = 'EVET' if s in products_by_slot else 'hayır'
+    hamming = '±1' if info.get('hamming_corrected') else ''
+    print(f'  S{s+1:2d}  {"EVET" if gt_slot[s] else "hayır":>8s} '
+          f'{MAT_NAMES[int(gt_mat[s])]:>10s} '
+          f'{pred_dolu:>10s} '
+          f'{str(info.get("id","-")):>8s} '
+          f'{info.get("name","-")[:23]:>25s} '
+          f'{info.get("material","-"):>10s} '
+          f'{hamming:>8s}')
+
+print(f'\nGörseller drive\'da:')
+print(f'  {out_png}    ← 8 senaryo grid')
+print(f'  {out_png2}   ← tam dolu 4 açı')
+print(f'  {csv_path}   ← tüm tahminler CSV (H9)')
+
+################################################################################
+# VOL2 SON — kapsamlı sınıf ortamı + 8 senaryo testi tamamlandı.
+# Jüri demosunda bu 3 PNG + jüri savunma metni (H9'da) ile sunum yapılabilir.
+################################################################################

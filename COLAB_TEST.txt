@@ -752,6 +752,71 @@ print('\nTek sample test render hazır.')
 # Mevcut test setinden farklı doluluk/materyal pattern'ine sahip sample'ları
 # filtrele. Yoksa en yakın eşleşmeyi al.
 
+# ── Auto-recovery: H5 değişkenleri eksikse otomatik yükle ────────
+# (Runtime restart veya sırasız çalıştırma sonrası kırılmasın diye)
+if 'test_ds' not in dir() or 'model' not in dir() or 'db' not in dir():
+    print('UYARI: H5 değişkenleri eksik → otomatik yükleniyor...')
+    import os, sys, shutil, torch as _torch
+    _PROJECT_ROOT = '/content/drive/MyDrive/PROJESON'
+    _TEST_DATA_PATH = '/content/drive/MyDrive/aether_core/test_data'
+    _CKPT_PATH = '/content/drive/MyDrive/aether_core/checkpoints/cla_war_off_150k_2026-06-03/full_best.pt'
+
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+    if os.getcwd() != _PROJECT_ROOT:
+        os.chdir(_PROJECT_ROOT)
+
+    # test_data symlink
+    if not os.path.islink('data') or os.readlink('data') != _TEST_DATA_PATH:
+        if os.path.exists('data'):
+            if os.path.islink('data'):
+                os.unlink('data')
+            elif os.path.isdir('data') and not os.path.exists('data_train_backup'):
+                shutil.move('data', 'data_train_backup')
+            else:
+                shutil.rmtree('data', ignore_errors=True)
+        os.symlink(_TEST_DATA_PATH, 'data')
+        print(f'  Symlink: data/ → {_TEST_DATA_PATH}')
+
+    from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
+    from models.fused_model import FusedCSIUWBNet
+    from backend.product_db import ProductDB
+    from data_synthesis.resonator_inject import hamming_decode_7_4, data_bits_to_int
+
+    TEST_PRESETS = [
+        {"name": "classroom_default"},
+        {"name": "warehouse_large"},
+        {"name": "office_small"},
+    ]
+    # Mevcut olanları filter et (eksik preset varsa atla)
+    TEST_PRESETS = [p for p in TEST_PRESETS
+                    if os.path.isdir(os.path.join(_TEST_DATA_PATH, p['name']))]
+    print(f'  Test presetler: {[p["name"] for p in TEST_PRESETS]}')
+
+    device = 'cuda' if _torch.cuda.is_available() else 'cpu'
+    test_ds = MultiDomainDataset(
+        data_root='data', config_root='configs',
+        presets=[p['name'] for p in TEST_PRESETS],
+        return_aux=False,
+    )
+    print(f'  test_ds yüklendi: {len(test_ds)} sample')
+
+    model = FusedCSIUWBNet().to(device)
+    if os.path.exists(_CKPT_PATH):
+        state = _torch.load(_CKPT_PATH, map_location=device)
+        model.load_state_dict(state['model'], strict=False)
+        model.eval()
+        extras = state.get('extras', {})
+        print(f'  Model yüklendi (ep {extras.get("best_epoch","?")}, '
+              f'det_f1={extras.get("best_f1","?")})')
+    else:
+        print(f'  UYARI: Ckpt yok ({_CKPT_PATH}) → model random init kalır.')
+
+    db = ProductDB()
+    print(f'  ProductDB: {len(db.all())} ürün')
+    print('Auto-recovery tamam ✓')
+
+import numpy as np
 from collections import defaultdict
 
 # Her sample için ground truth özet hazırla
@@ -860,10 +925,12 @@ for plot_idx, (label, sample_idx) in enumerate(SCENARIOS, 1):
     title = f'{label}\nsample #{sample_idx}  ·  GT dolu: {n_gt_filled}  ·  Tahmin dolu: {n_pred_filled}'
     render_full_classroom(ax, products_by_slot, title=title, view=(22, 35))
 
+_det_f1_str = f'{det_f1:.3f}' if 'det_f1' in dir() else '?'
+_id_acc_str = f'{id_accuracy:.3f}' if 'id_accuracy' in dir() else '?'
 plt.suptitle(
     f'Aether Core — 8 Senaryo Test (50 m² Sınıf Ortamı, classroom_default)\n'
     f'Trainlenmiş model: cla_war_off_150k_2026-06-03/full_best.pt  ·  '
-    f'Detection F1={det_f1:.3f}, ID acc={id_accuracy:.3f}',
+    f'Detection F1={_det_f1_str}, ID acc={_id_acc_str}',
     fontsize=14, fontweight='bold', y=0.995
 )
 plt.tight_layout(rect=[0, 0, 1, 0.97])
@@ -932,9 +999,11 @@ for s in range(6):
           f'{hamming:>8s}')
 
 print(f'\nGörseller drive\'da:')
-print(f'  {out_png}    ← 8 senaryo grid')
+if 'out_png' in dir():
+    print(f'  {out_png}    ← 8 senaryo grid')
 print(f'  {out_png2}   ← tam dolu 4 açı')
-print(f'  {csv_path}   ← tüm tahminler CSV (H9)')
+if 'csv_path' in dir():
+    print(f'  {csv_path}   ← tüm tahminler CSV (H9)')
 
 ################################################################################
 # VOL2 SON — kapsamlı sınıf ortamı + 8 senaryo testi tamamlandı.

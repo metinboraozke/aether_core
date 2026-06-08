@@ -891,12 +891,27 @@ for label, idx in SCENARIOS:
 # Her senaryoya modeli besle, tahminleri al, tüm sınıf ortamını render et.
 
 import torch
+from preprocessing import preprocess_csi, preprocess_uwb
 
 def model_forward_single(sample):
-    """Tek bir sample için model forward + DB lookup → products_by_slot dict."""
-    csi = torch.from_numpy(np.asarray(sample['csi'])).float().unsqueeze(0).to(device)
-    uwb = torch.from_numpy(np.asarray(sample['uwb'])).float().unsqueeze(0).to(device)
+    """Tek bir sample için model forward + DB lookup → products_by_slot dict.
+
+    NOT: Raw sample formatı (28, 108, 2) ve (6, 32, 2) — model channel-first
+    (B, 28, 2, 108) ve (B, 6, 2, 32) bekliyor. preprocess_csi/uwb axis swap
+    + normalize yapar. H6'da collate_with_preprocess otomatik çağırıyordu,
+    burada manuel.
+    """
+    csi_raw = np.asarray(sample['csi'])   # (28, 108, 2)
+    uwb_raw = np.asarray(sample['uwb'])   # (6, 32, 2)
+
+    # Preprocess (batch dim ekle: 1 sample)
+    csi_proc = preprocess_csi(csi_raw[None, ...], apply_dwt=False)  # (1, 28, 2, 108)
+    uwb_proc = preprocess_uwb(uwb_raw[None, ...])                    # (1, 6, 2, 32)
+
+    csi = torch.from_numpy(csi_proc).float().to(device)
+    uwb = torch.from_numpy(uwb_proc).float().to(device)
     lg = torch.from_numpy(np.asarray(sample['link_geo'])).float().unsqueeze(0).to(device)
+
     with torch.no_grad():
         out = model(csi, uwb, lg, return_aux=False)
     det = (torch.sigmoid(out['detection_logits'][0]) > 0.5).cpu().numpy()

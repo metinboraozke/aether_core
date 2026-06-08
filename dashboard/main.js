@@ -228,6 +228,69 @@ function renderSlotStatus(detection, products) {
 }
 
 
+// ── Demo Mode toggle (sistem test için lokal sample injection) ────
+
+let demoTimer = null;
+let demoActive = false;
+let demoTickCount = 0;
+
+async function demoTickOnce() {
+  try {
+    const res = await fetch('/api/demo/tick', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      console.warn('[demo] error:', data.error, data.hint || '');
+      stopDemo();
+      const btn = document.getElementById('demo-toggle');
+      if (btn) btn.textContent = '⚠ Demo Hata (log\'a bak)';
+      return;
+    }
+    demoTickCount++;
+    document.getElementById('demo-tick-count').textContent = demoTickCount;
+    const lastProduct = data.products_detected?.[0];
+    document.getElementById('demo-last-id').textContent = lastProduct
+      ? `#${lastProduct.id} ${lastProduct.name.slice(0, 20)}`
+      : '-';
+  } catch (err) {
+    console.error('[demo] tick fail:', err);
+  }
+}
+
+function startDemo() {
+  if (demoActive) return;
+  demoActive = true;
+  demoTickCount = 0;
+  const btn = document.getElementById('demo-toggle');
+  if (btn) {
+    btn.textContent = '⏸ Demo Durdur';
+    btn.style.background = '#3a1e1e';
+  }
+  document.getElementById('demo-stats').style.display = 'block';
+  // İlk tick hemen, sonra her 1 saniyede
+  demoTickOnce();
+  demoTimer = setInterval(demoTickOnce, 1000);
+  console.log('[demo] başladı (her 1s)');
+}
+
+function stopDemo() {
+  if (!demoActive) return;
+  demoActive = false;
+  if (demoTimer) clearInterval(demoTimer);
+  demoTimer = null;
+  const btn = document.getElementById('demo-toggle');
+  if (btn) {
+    btn.textContent = '▷ Demo Başlat';
+    btn.style.background = '#1e3a3a';
+  }
+  console.log('[demo] durdu');
+}
+
+document.getElementById('demo-toggle')?.addEventListener('click', () => {
+  if (demoActive) stopDemo();
+  else startDemo();
+});
+
+
 // ── Products view init + render loop ──────────────────────
 
 initProductsView();   // /api/products fetch + katalog grid render

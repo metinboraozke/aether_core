@@ -195,6 +195,20 @@
       </h1>
       <button class="nav-btn active" data-view="live">▶ Canlı Voxel</button>
       <button class="nav-btn" data-view="products">📦 Ürün Kataloğu</button>
+
+      <!-- Demo Mode toggle (2026-06-03: sistem test için) -->
+      <div style="margin-top:18px; padding-top:14px; border-top:1px solid #2a2a2a;">
+        <div style="color:#888; font-size:11px; margin-bottom:6px;">DEMO MODE</div>
+        <button class="nav-btn" id="demo-toggle" style="background:#1e3a3a;">▷ Demo Başlat</button>
+        <div style="margin-top:8px; font-size:10px; color:#666;">
+          Lokal dataset'ten her saniyede random sample.
+          <br>(Gerçek sensör yokken sistem testi)
+        </div>
+        <div id="demo-stats" style="margin-top:6px; font-size:11px; color:#4caf50; display:none;">
+          Tick: <span id="demo-tick-count">0</span> · ID: <span id="demo-last-id">-</span>
+        </div>
+      </div>
+
       <div class="spacer"></div>
       <div id="sidebar-status">
         <span class="dot" id="sidebar-ws-dot"></span>

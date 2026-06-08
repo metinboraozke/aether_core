@@ -202,6 +202,85 @@ async def get_product(product_id: int) -> dict:
     return engine.product_db.lookup(product_id)
 
 
+# ── Demo data injection (2026-06-03): jüri test + sistem doğrulama ──
+
+
+@app.post("/api/demo/tick")
+async def demo_tick(sample_idx: int | None = None) -> dict:
+    """Lokal dataset'ten bir sample alıp model forward yap + WS broadcast.
+
+    Gerçek sensör yokken dashboard'da canlı sahne göstermek için.
+    sample_idx None ise random sample seçilir.
+
+    Veri yolu: data/classroom_default/ (lokal symlink veya direkt klasör).
+    İlk çağrıda dataset lazy load edilir, sonraki çağrılarda cache kullanılır.
+    """
+    engine = app.state.engine
+
+    # Lazy load dataset
+    if not hasattr(engine, '_demo_dataset') or engine._demo_dataset is None:
+        try:
+            from data_synthesis.multi_domain_dataset import MultiDomainDataset
+            import os as _os
+            # data/classroom_default varsa onu kullan, yoksa hata
+            if not _os.path.isdir('data/classroom_default'):
+                return {
+                    "error": "data/classroom_default klasörü yok",
+                    "hint": "Drive senkron veya lokal mini veri lazım."
+                }
+            engine._demo_dataset = MultiDomainDataset(
+                data_root='data', config_root='configs',
+                presets=['classroom_default'], return_aux=False,
+            )
+            print(f"[demo] dataset yüklendi: {len(engine._demo_dataset)} sample")
+        except Exception as e:
+            return {"error": f"dataset load: {e}"}
+
+    ds = engine._demo_dataset
+    import numpy as _np
+    if sample_idx is None or sample_idx < 0 or sample_idx >= len(ds):
+        sample_idx = int(_np.random.randint(0, len(ds)))
+
+    try:
+        sample = ds[sample_idx]
+        # MultiDomainDataset.__getitem__ → dict {csi, uwb, link_geo, labels, ...}
+        packet = engine.inject_dataset_sample(
+            csi_raw=_np.asarray(sample['csi']),
+            uwb_raw=_np.asarray(sample['uwb']),
+            link_geo=_np.asarray(sample['link_geo']),
+        )
+        # WS broadcast (dashboard subscribers'a yayın)
+        await engine._broadcast(packet)
+        return {
+            "status": "ok",
+            "sample_idx": sample_idx,
+            "tick_count": engine.tick_count,
+            "inference_ms": packet["telemetry"]["inference_ms"],
+            "n_filled_slots": int(sum(packet["detection_mask"])),
+            "products_detected": [
+                {"slot": p["slot"], "id": p["id"], "name": p["name"]}
+                for p in packet["products"] if not p.get("empty")
+            ],
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": f"tick fail (idx={sample_idx}): {e}"}
+
+
+@app.get("/api/demo/info")
+async def demo_info() -> dict:
+    """Demo dataset bilgisi (boyut, hangi preset)."""
+    engine = app.state.engine
+    if not hasattr(engine, '_demo_dataset') or engine._demo_dataset is None:
+        return {"loaded": False, "hint": "İlk /api/demo/tick çağrısında yüklenir"}
+    return {
+        "loaded": True,
+        "n_samples": len(engine._demo_dataset),
+        "presets": list(engine._demo_dataset.presets),
+    }
+
+
 # ── Uvicorn entry point ───────────────────────────────────
 
 

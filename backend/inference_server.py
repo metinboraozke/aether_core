@@ -269,6 +269,89 @@ class InferenceEngine:
         self.last_packet = packet
         return packet
 
+    # ── Test data injection (jüri demo + sistem test) ──────
+
+    def inject_dataset_sample(
+        self,
+        csi_raw: np.ndarray,             # (28, 108, 2)
+        uwb_raw: np.ndarray,             # (6, 32, 2)
+        link_geo: np.ndarray | None = None,  # (28, 3) — None ise self.link_geo_np
+    ) -> dict[str, Any]:
+        """Test data injection: sync_buffer bypass, direkt model forward + paket build.
+
+        D Paketi sonrası dashboard'da canlı sahne göstermek için. /api/demo/tick
+        endpoint'i bu method'u çağırır. Gerçek sensör paketi gelmesini beklemez.
+        """
+        # 1) Adaptive baseline (CSI drift düzeltme)
+        self.baseline.update(csi_raw, detection_mask=self.last_detection_mask)
+        csi_delta = self.baseline.compute_delta(csi_raw)
+
+        # 2) Preprocess (batch dim ekle)
+        csi_proc = preprocess_csi(csi_delta[None, ...], apply_dwt=False)
+        uwb_proc = preprocess_uwb(uwb_raw[None, ...])
+
+        # 3) Model forward
+        t0 = time.perf_counter()
+        if self.model is None:
+            model_out = self._mock_model_output()
+        else:
+            if torch is None:
+                raise RuntimeError("torch import yok")
+            csi_t = torch.from_numpy(csi_proc).float().to(self.device)
+            uwb_t = torch.from_numpy(uwb_proc).float().to(self.device)
+            # Link geo: sample'ın kendisinden veya default
+            if link_geo is not None:
+                lg_t = torch.from_numpy(link_geo[None, ...]).float().to(self.device)
+            else:
+                lg_t = self.link_geo_t
+            with torch.no_grad():
+                model_out = self.model(csi_t, uwb_t, lg_t)
+            model_out = self._tensorize_out(model_out)
+
+        inf_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_inference_ms = inf_ms
+        self.inference_total_ms += inf_ms
+        self.tick_count += 1
+
+        # 4) Tracker (sliding window CSI)
+        track = self.tracker.step(csi_delta.astype(np.float32))
+
+        # 5) Detection mask güncelle
+        det_mask = np.array(model_out["detection_mask"], dtype=np.uint8)
+        self.last_detection_mask = det_mask.flatten()[:6]
+
+        # 6) ProductDB lookup
+        products = []
+        if self.product_db is not None and "codeword_logits_raw" in model_out:
+            try:
+                products = self.product_db.build_packet_products(
+                    detection_mask=det_mask,
+                    codeword_logits=model_out["codeword_logits_raw"],
+                    material_logits=None,  # D paketi bypass
+                )
+            except Exception as e:
+                print(f"[InferenceEngine] ProductDB build hatası: {e}")
+                products = []
+
+        # 7) Paket build (step_one_tick ile aynı şema)
+        packet = {
+            "t_master_ns": int(time.time_ns()),
+            "detection_mask": model_out["detection_mask"],
+            "materials": model_out["materials"],
+            "products": products,
+            "barcode_sparse": model_out["barcode_sparse"],
+            "uncertainty": model_out["uncertainty"],
+            "tracking": track,
+            "telemetry": {
+                "inference_ms": round(inf_ms, 3),
+                "tick_count": self.tick_count,
+                "sync": self.sync_buffer.telemetry(),
+                "source": "demo_injection",
+            },
+        }
+        self.last_packet = packet
+        return packet
+
     # ── Mock + tensor helpers ──────────────────────────────
 
     def _mock_model_output(self) -> dict[str, Any]:

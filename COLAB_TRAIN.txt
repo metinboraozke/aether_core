@@ -250,6 +250,9 @@ print('\nTÜM SAĞLIK KONTROLLERİ GEÇTİ ✓')
 # Veri klasöründe gerekli dosyalar var mı, kaç sample, kaç variant?
 # Süre: ~5 sn.
 
+# Standalone importlar (önceki hücrelere bağımlı kalmaz)
+import os, numpy as np, yaml
+
 PRESET = 'classroom_default'
 PDIR = f'data/{PRESET}'   # PROJECT_ROOT relative (symlink → aether_core/data)
 
@@ -321,8 +324,11 @@ print(f'→ Eğitime hazır: {"EVET ✓" if all_ok and paired and slot_uwb.shape
 # B paketi (NaN guard, grad clip, best ckpt, component log) sorunsuz mu?
 # D paketi (recognition λ=0) component log'da rec=0.0×... görünür mü?
 
-import time
+# Standalone importlar
+import time, torch
 from torch.utils.data import DataLoader, Subset
+from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
+from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
 ds = MultiDomainDataset(
     data_root='data', config_root='configs',
@@ -366,8 +372,11 @@ shutil.rmtree('/content/smoke_ckpt', ignore_errors=True)
 # B + C + D + E paketleri tüm patch'leri aktif.
 # Best checkpoint drive'a otomatik yazılır.
 
-import time
+# Standalone importlar
+import os, time, torch, numpy as np
 from torch.utils.data import DataLoader, random_split
+from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
+from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
 # Production parametreleri
 EPOCHS         = 40        # B/D: rec=0 ile aux+kd öğrenme için 40 ep buffer
@@ -455,6 +464,8 @@ for k, v in result['val_metrics'].items():
 # HÜCRE 8 — VAL PROGRESSION + LOSS COMPONENT GÖRSELLEŞTİRME
 # ============================================================================
 # Eğitim geçmişini grafikle göster (val det_f1, id_bit + lr profili + components).
+# ÖN KOŞUL: H7 önce çalıştırılmış olmalı (result + CKPT_DIR + EPOCHS + n_total
+# değişkenleri H7'den miras alınır).
 
 import matplotlib.pyplot as plt
 

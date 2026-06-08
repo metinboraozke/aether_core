@@ -367,10 +367,19 @@ shutil.rmtree('/content/smoke_ckpt', ignore_errors=True)
 
 
 # ============================================================================
-# HÜCRE 7 — ANA EĞİTİM (50k × 40 ep × full varyant, ~50-65 dk L4)
+# HÜCRE 7 — ANA EĞİTİM (multi-preset, full varyant, ~50-90 dk L4)
 # ============================================================================
 # B + C + D + E paketleri tüm patch'leri aktif.
 # Best checkpoint drive'a otomatik yazılır.
+#
+# PRESETS değiştirilebilir:
+#   ['classroom_default']                      → 50k tek-preset (eski mod)
+#   ['classroom_default','warehouse_large']    → 100k (2 oda)
+#   ['classroom_default','warehouse_large','office_small']  → 150k (3 oda)
+#
+# Multi-preset avantajı: MultiDomainDataset 3 oda'yı birleştirip interleaved
+# shuffle batching yapar → encoder farklı geometriler görür → sim2real bridge
+# güçlenir (gerçek dünyada yeni odada daha az kalibrasyon gerektirir).
 
 # Standalone importlar
 import os, time, torch, numpy as np
@@ -378,31 +387,36 @@ from torch.utils.data import DataLoader, random_split
 from data_synthesis.multi_domain_dataset import MultiDomainDataset, collate_with_preprocess
 from training.ablation import run_single_ablation, ABLATION_VARIANTS
 
-# Production parametreleri
-EPOCHS         = 40        # B/D: rec=0 ile aux+kd öğrenme için 40 ep buffer
-BATCH_SIZE     = 64        # L4 GPU için uygun (24 GB VRAM)
+# ─── Eğitim Parametreleri ────────────────────────────────────────────────────
+PRESETS        = ['classroom_default', 'warehouse_large', 'office_small']
+                            # Drive'da hangi klasörler varsa onları ekle.
+                            # Her preset 50k sample varsayılıyor.
+EPOCHS         = 25        # multi-preset için yumuşatıldı (önceki run 40 ep'te
+                            # ep 11+ NaN sarmalına girdi; plateau ep 10'da yakalandı).
+                            # 25 ep + early stop patience=3 = pratik tavan.
+BATCH_SIZE     = 64        # L4 GPU için uygun (24 GB VRAM, ~3-4 GB kullanım)
 LR             = 1.0e-3    # peak lr (warmup sonrası)
 WARMUP_EPOCHS  = 2         # ilk 2 ep lineer warmup 1e-5 → 1e-3
-ETA_MIN        = 1.0e-5    # cosine'in min'i (40 ep yumuşak kuyruk)
+ETA_MIN        = 1.0e-5    # cosine'in min'i
 VAL_INTERVAL   = 5         # her 5 ep validation
-PATIENCE       = 5         # 5 val_interval iyileşme yoksa early stop
-NUM_WORKERS    = 0         # Colab notebook multiprocessing bug → 0 zorunlu
-                            # (PyTorch issue #80027: persistent_workers + Jupyter
-                            # process modeli → __del__ AssertionError spam.
-                            # Hız kaybı L4 GPU'da ~%15, kabul edilebilir)
-VAL_SPLIT      = 0.1       # %10 validation (5k val, 45k train)
+PATIENCE       = 3         # 3 val_interval iyileşme yoksa early stop
+                            # (önceki 5'ten düşürüldü → plateau'da daha çabuk kes)
+NUM_WORKERS    = 0         # Colab notebook multiprocessing bug (PyTorch #80027)
+VAL_SPLIT      = 0.1       # %10 validation (15k val, 135k train @ 150k toplam)
 SEED           = 42
 
-# Drive checkpoint dizini (eğitim sonu kalıcı)
-CKPT_DIR = '/content/drive/MyDrive/aether_core/checkpoints/classroom_50k_2026-06-03'
+# Drive checkpoint dizini — preset isimlerine göre otomatik adlandır
+preset_tag = '_'.join(p[:3] for p in PRESETS)  # örn: 'cla_war_off'
+CKPT_DIR = f'/content/drive/MyDrive/aether_core/checkpoints/{preset_tag}_{len(PRESETS)*50}k_2026-06-03'
 os.makedirs(CKPT_DIR, exist_ok=True)
+# ─────────────────────────────────────────────────────────────────────────────
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 
-# Tam 50k dataset (sadece classroom_default)
+# Dataset: multi-preset MultiDomainDataset interleaved
 ds = MultiDomainDataset(
     data_root='data', config_root='configs',
-    presets=['classroom_default'], return_aux=True,
+    presets=PRESETS, return_aux=True,
 )
 n_total = len(ds)
 n_val = max(1, int(n_total * VAL_SPLIT))
@@ -426,15 +440,24 @@ val_loader = DataLoader(
     collate_fn=collate_with_preprocess,
 )
 
-print(f'=== ANA EĞİTİM: classroom_default {n_total:,} × {EPOCHS} epoch ===')
-print(f'Train  : {n_train:,} | Val: {n_val:,}')
-print(f'Batch  : {BATCH_SIZE} | LR: {LR:.0e} → {ETA_MIN:.0e} (warmup {WARMUP_EPOCHS} + cosine)')
+print(f'=== ANA EĞİTİM: {len(PRESETS)} preset × {n_total//len(PRESETS):,} sample ===')
+print(f'Presets: {PRESETS}')
+print(f'Train  : {n_train:,} | Val: {n_val:,} (toplam {n_total:,})')
+print(f'Epochs : {EPOCHS} | Batch: {BATCH_SIZE} | LR: {LR:.0e} → {ETA_MIN:.0e}')
+print(f'        warmup {WARMUP_EPOCHS} + cosine {EPOCHS-WARMUP_EPOCHS}')
+print(f'Val    : her {VAL_INTERVAL} ep, patience={PATIENCE} (plateau early stop)')
 print(f'Device : {device.upper()}')
 print(f'Ckpt   : {CKPT_DIR}')
 print(f'Lambda : DEFAULT (det=1, rec=0, id=1, tsdf=0.3, aux=0.3, kd=0.5)')
-print(f'         (D paketi: recognition λ=0 → bypass, material DB lookup ile)')
+print(f'         (D paketi: recognition λ=0 bypass, material DB lookup ile)')
 print(f'         Beklenen rec_acc ~0.25 random NORMAL — eğitilmez, debug bilgisi.')
 print(f'E pkt  : identification BCE alpha=1.0, triplet margin=0.15')
+
+# Estimated time: 3 preset × 50k × 25 ep × ~25 sn/ep L4 = ~30 dk per preset
+# Total: ~75-90 dk
+preset_count = len(PRESETS)
+est_min = preset_count * 25  # rough estimate
+print(f'\nTahmini süre: ~{est_min}-{est_min+15} dk L4 GPU\n')
 
 t0 = time.perf_counter()
 result = run_single_ablation(
@@ -466,14 +489,44 @@ for k, v in result['val_metrics'].items():
 # Eğitim geçmişini grafikle göster (val det_f1, id_bit + lr profili + components).
 # ÖN KOŞUL: H7 önce çalıştırılmış olmalı (result + CKPT_DIR + EPOCHS + n_total
 # değişkenleri H7'den miras alınır).
+#
+# FALLBACK: H7 manuel durdurulduysa (NaN sarmalı veya kullanıcı stop),
+# `result` undefined → bu hücre drive'daki best ckpt extras'tan minimum
+# bilgi gösterir, grafik çizmez.
 
 import matplotlib.pyplot as plt
+import os, torch
 
-vh = result.get('val_history', [])
-th = result.get('train_history', [])
+# Defansif: H7 tamamlanmadıysa veya hata aldıysa fallback mesaj
+_has_result = False
+try:
+    vh = result.get('val_history', [])
+    th = result.get('train_history', [])
+    _has_result = bool(vh) and bool(th)
+except NameError:
+    print('UYARI: result undefined → H7 muhtemelen manuel durduruldu veya hata aldı.')
+    print('Drive\'daki best ckpt extras\'tan minimum bilgi çekiliyor...')
+    try:
+        ckpt_files = [f for f in os.listdir(CKPT_DIR) if f.endswith('_best.pt')]
+        if ckpt_files:
+            ckpt_path = os.path.join(CKPT_DIR, ckpt_files[0])
+            state = torch.load(ckpt_path, map_location='cpu')
+            extras = state.get('extras', {})
+            print(f'  Checkpoint    : {ckpt_path}')
+            print(f'  best_epoch    : {extras.get("best_epoch", "?")}')
+            print(f'  best_f1       : {extras.get("best_f1", "?")}')
+            print(f'  early_stopped : {extras.get("early_stopped", "?")}')
+            print(f'  variant       : {extras.get("variant", "?")}')
+            print()
+            print('Ckpt extras\'ta val_history/train_history yok → grafik çizilemez.')
+            print('H7\'yi tam tamamlayıp tekrar dene.')
+        else:
+            print(f'  {CKPT_DIR} içinde *_best.pt yok — H7 hiç çalışmamış.')
+    except NameError:
+        print('  CKPT_DIR de undefined — H7\'yi en az parametre tanımlayacak kadar koştur.')
 
-if not vh or not th:
-    print('History boş, grafik çizilemiyor.')
+if not _has_result:
+    print('\nGrafik atlandı.')
 else:
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
@@ -536,20 +589,68 @@ else:
 # ============================================================================
 # HÜCRE 9 — SONUÇ RAPORU + BAŞARI KRİTERLERİ
 # ============================================================================
+# Defansif: H7 manuel durduruldu / hata aldıysa drive'daki best ckpt'ten
+# extras dict'ini okur. result undefined ise minimum bilgi gösterir.
+
+import os, torch
+
+try:
+    _r = result
+    _meta_source = 'H7 result (canlı)'
+except NameError:
+    print('UYARI: result undefined → H7 tamamlanmamış. Best ckpt extras okunuyor...')
+    try:
+        ckpt_files = [f for f in os.listdir(CKPT_DIR) if f.endswith('_best.pt')]
+    except NameError:
+        print('  CKPT_DIR de undefined — H7\'yi en az parametre seti tanımlayacak kadar koştur.')
+        ckpt_files = []
+    if ckpt_files:
+        ckpt_path = os.path.join(CKPT_DIR, ckpt_files[0])
+        state = torch.load(ckpt_path, map_location='cpu')
+        extras = state.get('extras', {})
+        _r = {
+            'best_epoch': extras.get('best_epoch', '?'),
+            'best_f1': extras.get('best_f1', None),
+            'early_stopped': extras.get('early_stopped', '?'),
+            'checkpoint_path': ckpt_path,
+            'val_metrics': {},   # ckpt'te val metrics yok → boş, kriter testi atlanır
+        }
+        _meta_source = f'Drive ckpt extras ({ckpt_files[0]})'
+    else:
+        _r = None
+        _meta_source = 'YOK'
 
 print(f'{"="*70}')
-print(f'AETHER CORE — classroom_default {n_total//1000}k EĞİTİM RAPORU')
+preset_str = ' + '.join(PRESETS) if 'PRESETS' in dir() else '?'
+total_k = f'{n_total//1000}k' if 'n_total' in dir() else '?'
+print(f'AETHER CORE — {preset_str} {total_k} EĞİTİM RAPORU')
 print(f'{"="*70}')
 print(f'Tarih          : 2026-06-03 (D + E paketleri sonrası)')
-print(f'Veri           : {n_train:,} train + {n_val:,} val')
-print(f'Model          : FusedCSIUWBNet (~2.91M param)')
-print(f'Eğitim süresi  : {total_min:.1f} dk')
-print(f'Best epoch     : {result["best_epoch"]} / {EPOCHS}')
-print(f'Early stopped  : {result["early_stopped"]}')
-print(f'Checkpoint     : {result["checkpoint_path"]}')
+print(f'Meta kaynağı   : {_meta_source}')
+if _r is None:
+    print('\n✗ Eğitim sonucu yok. H7\'yi tam tamamla ve tekrar dene.')
+else:
+    if 'n_train' in dir():
+        print(f'Veri           : {n_train:,} train + {n_val:,} val')
+    print(f'Model          : FusedCSIUWBNet (~2.91M param)')
+    if 'total_min' in dir():
+        print(f'Eğitim süresi  : {total_min:.1f} dk')
+    print(f'Best epoch     : {_r["best_epoch"]}{" / " + str(EPOCHS) if "EPOCHS" in dir() else ""}')
+    print(f'Early stopped  : {_r["early_stopped"]}')
+    print(f'Checkpoint     : {_r["checkpoint_path"]}')
+
+# Eski result referanslarını _r ile değiştir
+result = _r if _r is not None else {'val_metrics': {}, 'best_epoch': '?', 'best_f1': None,
+                                      'early_stopped': '?', 'checkpoint_path': 'yok'}
 
 print(f'\n{"BAŞARI KRİTERLERİ (production hedefleri)":~^70}')
-m = result['val_metrics']
+m = result.get('val_metrics', {})
+
+if not m:
+    print('  val_metrics boş (H7 tamamlanmamış veya ckpt extras\'tan yüklendi)')
+    print('  Başarı kriteri testi atlandı — manuel evaluate gerekirse:')
+    print('    from training.eval import evaluate')
+    print('    evaluate(model, val_loader, device=device)  # ckpt yükle önce')
 
 def check(name, value, threshold, op='≥'):
     passed = value >= threshold if op == '≥' else value <= threshold
@@ -559,30 +660,36 @@ def check(name, value, threshold, op='≥'):
     return passed
 
 passed = []
-passed.append(check('det_f1',                    m['det_f1'],          0.78))
-passed.append(check('id_bit_accuracy',           m['id_bit_accuracy'], 0.70))
-passed.append(check('id_full_codeword_accuracy', m['id_full_codeword_accuracy'], 0.15))
+if m:
+    passed.append(check('det_f1',                    m.get('det_f1', 0),          0.78))
+    passed.append(check('id_bit_accuracy',           m.get('id_bit_accuracy', 0), 0.70))
+    passed.append(check('id_full_codeword_accuracy', m.get('id_full_codeword_accuracy', 0), 0.15))
 
-# Recognition NORMAL kontrol (random olmalı)
-rec_normal = 0.20 <= m.get('rec_accuracy', 0) <= 0.30
-mark = '✓' if rec_normal else '✗'
-status = 'NORMAL (bypass)' if rec_normal else 'BEKLENMEDİK'
-print(f'  {mark} rec_accuracy (bypass)     = {m.get("rec_accuracy", 0):.4f}  '
-      f'(beklenen 0.25 random)  [{status}]')
+    # Recognition NORMAL kontrol (random olmalı)
+    rec_normal = 0.20 <= m.get('rec_accuracy', 0) <= 0.30
+    mark = '✓' if rec_normal else '✗'
+    status = 'NORMAL (bypass)' if rec_normal else 'BEKLENMEDİK'
+    print(f'  {mark} rec_accuracy (bypass)     = {m.get("rec_accuracy", 0):.4f}  '
+          f'(beklenen 0.25 random)  [{status}]')
 
-print(f'\n{"="*70}')
-if all(passed):
-    print('✅ TÜM KRİTERLER GEÇTİ — Jüri demosuna hazır')
-    print('   Material classification DB lookup ile %100 (ID doğru bilindiğinde)')
-elif passed[0] and passed[1]:
-    print('⚠️  KISMİ BAŞARI — det + id_bit OK, codeword sınırda')
-    print('   DB lookup hâlâ çalışır ama Hamming düzeltme sık tetiklenebilir')
+    print(f'\n{"="*70}')
+    if all(passed):
+        print('✅ TÜM KRİTERLER GEÇTİ — Jüri demosuna hazır')
+        print('   Material classification DB lookup ile %100 (ID doğru bilindiğinde)')
+    elif passed[0] and passed[1]:
+        print('⚠️  KISMİ BAŞARI — det + id_bit OK, codeword sınırda')
+        print('   DB lookup hâlâ çalışır ama Hamming düzeltme sık tetiklenebilir')
+    else:
+        print('❌ HEDEF ALTI — ek tanı veya εr kontrast retrain gerekli')
 else:
-    print('❌ HEDEF ALTI — ek tanı veya εr kontrast retrain gerekli')
+    print(f'\n{"="*70}')
+    print('⚠️  val_metrics boş — başarı kriteri değerlendirilemedi.')
+    print('  H7\'yi tam koştur veya manuel evaluate() çağır.')
 
 print(f'\nÇıktı dosyaları drive\'da:')
-print(f'  - {result["checkpoint_path"]}')
-print(f'  - {CKPT_DIR}/training_curves.png')
+print(f'  - {result.get("checkpoint_path", "?")}')
+if 'CKPT_DIR' in dir():
+    print(f'  - {CKPT_DIR}/training_curves.png')
 
 print(f'\n--- Sonraki adımlar ---')
 print(f'1. Bu checkpoint\'i lokale çek (uvicorn için):')
